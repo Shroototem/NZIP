@@ -48,6 +48,7 @@ step the GPU accelerates).
 | `-M 4G` | Memory budget for buffers (default: half of the available RAM) |
 | `-b 640M` | Block size (default 1 GiB in max mode) |
 | `-f` | Overwrite an existing output |
+| `nzip.exe gpu` | Show GPU support, driver status and free GPU memory |
 | `--no-dedup`, `--no-transforms` | Turn off long-range dedup / the deflate unpacking, dictionary, executable and table transforms |
 
 ## GPU build (build it on Windows)
@@ -57,8 +58,21 @@ NVIDIA's CUDA compiler needs Microsoft's compiler on Windows, so a GPU-enabled W
 
 1. Install Visual Studio 2022 (Desktop development with C++), the CUDA Toolkit 13
    (sets `CUDA_PATH`) and Rust (https://rustup.rs, MSVC toolchain).
-2. In the source folder: `cargo build --release -p nzip-cli`
-3. The result is `target\release\nzip.exe`; the build finds CUDA through `CUDA_PATH`.
-   Without CUDA the same command makes a CPU-only build.
+   Use an NVIDIA driver at least as new as the toolkit (CUDA 13 installers no longer
+   include the driver).
+2. In a new terminal, in the source folder:
+   `set NZIP_REQUIRE_CUDA=1` (PowerShell: `$env:NZIP_REQUIRE_CUDA=1`), then
+   `cargo build --release -p nzip-cli`.
+   With `NZIP_REQUIRE_CUDA` set, the build stops with the reason if it can't find CUDA,
+   instead of quietly making a CPU-only build (it prints a
+   "building WITHOUT GPU support: ..." warning otherwise).
+3. The result is `target\release\nzip.exe`. Check it with `nzip.exe gpu`: it shows
+   whether the build has GPU code, whether the driver works (with the CUDA error in
+   plain words if not) and the largest block sort that fits the GPU's free memory.
+
+The GPU sorts a block only if it fits the free GPU memory (~21 bytes per byte), so on a
+16 GB card the default 1 GiB blocks are borderline: Windows and open programs (browsers,
+games, Discord) hold GPU memory too. After a max-mode run, nzip says when blocks went to
+the CPU for lack of memory; close GPU-heavy programs or use `-b 512M`.
 
 Third-party components and their licenses: see `THIRD_PARTY_NOTICES.md`.

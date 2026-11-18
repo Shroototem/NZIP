@@ -32,6 +32,10 @@ static CPU_RATE: AtomicU64 = AtomicU64::new(45_000_000);
 static CPU_BUSY: AtomicUsize = AtomicUsize::new(0);
 /// Blocks sorted on the GPU in this process.
 pub static GPU_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// Largest sort that went to the CPU because it didn't fit the GPU's free memory, and
+/// the memory that was available then (bytes; 0 = none).
+static SHORT_SORT: AtomicUsize = AtomicUsize::new(0);
+static SHORT_AVAIL: AtomicUsize = AtomicUsize::new(0);
 
 /// `NZIP_TRACE=1`: print a stage timeline to stderr (seconds since the first block).
 fn trace(what: &str, n: usize) {
@@ -48,14 +52,33 @@ const VRAM_MARGIN: usize = 384 << 20;
 /// definitive answer).
 fn fits(n: usize) -> bool {
     let cached = GPU_CACHED.load(Acquire);
-    if n + n / 32 <= cached {
-        return true; // libbsc's device storage already covers it
-    }
-    // libbsc frees its cache before allocating the larger one (n + n/32 slots; ~20.4
-    // bytes per slot, so 21 per input byte covers the slack).
+    n + n / 32 <= cached // libbsc's device storage already covers it
+        || available() >= need(n)
+}
+
+/// Device memory a sort may use: free memory plus libbsc's cached storage (libbsc frees
+/// its cache before allocating a larger one).
+fn available() -> usize {
     let per = bsc_sys::GPU_BYTES_PER_BLOCK_BYTE;
-    let avail = bsc_sys::gpu_free_memory() + cached * per * 32 / 33;
-    avail.saturating_sub(VRAM_MARGIN) / per >= n
+    bsc_sys::gpu_free_memory() + GPU_CACHED.load(Acquire) * per * 32 / 33
+}
+
+/// Device memory a sort of `n` bytes needs (n + n/32 slots of ~20.4 bytes; 21 per
+/// input byte covers the slack), plus the margin.
+pub fn need(n: usize) -> usize {
+    n * bsc_sys::GPU_BYTES_PER_BLOCK_BYTE + VRAM_MARGIN
+}
+
+/// Largest sort (LZP output bytes) that fits the GPU right now (0 without a GPU).
+pub fn max_gpu_sort() -> usize {
+    available().saturating_sub(VRAM_MARGIN) / bsc_sys::GPU_BYTES_PER_BLOCK_BYTE
+}
+
+/// If some sort went to the CPU for lack of GPU memory: (largest such sort's memory
+/// need, memory available then), in bytes.
+pub fn shortfall() -> Option<(usize, usize)> {
+    let n = SHORT_SORT.load(Relaxed);
+    (n > 0).then(|| (need(n), SHORT_AVAIL.load(Relaxed)))
 }
 
 fn ewma(r: &AtomicU64, bytes: usize, secs: f64) {
@@ -84,7 +107,11 @@ pub fn bsc_block(data: &[u8], coder: i32, total: usize, gpu: bool) -> Result<(Ve
     let n = s.sort_len();
     trace("lzp done", n);
     let mut on_gpu = false;
-    if gpu && n >= 1 << 20 && !GPU_OFF.load(Acquire) && fits(n) {
+    let eligible = gpu && n >= 1 << 20 && !GPU_OFF.load(Acquire);
+    if eligible && !fits(n) && SHORT_SORT.fetch_max(n, Relaxed) < n {
+        SHORT_AVAIL.store(available(), Relaxed);
+    }
+    if eligible && fits(n) {
         // Queue for the GPU unless the CPU would finish this sort before the queue drains.
         let queued = GPU_QUEUED.fetch_add(n, AcqRel) + n;
         let gpu_eta = queued as f64 / GPU_RATE.load(Relaxed) as f64;

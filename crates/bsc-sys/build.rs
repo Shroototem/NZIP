@@ -23,19 +23,30 @@ pub fn target() -> Target {
 
 /// CUDA toolkit for this target. nvcc can't cross-compile host code between OSes, so a
 /// Windows GPU build must be made on Windows (Visual Studio + CUDA, found via CUDA_PATH).
-fn find_cuda(t: &Target) -> Option<PathBuf> {
-    if std::env::var_os("NZIP_NO_CUDA").is_some() {
-        return None;
+/// Err says why there is none (shown as a build warning; an error with NZIP_REQUIRE_CUDA=1).
+fn find_cuda(t: &Target) -> Result<PathBuf, String> {
+    if t.windows != cfg!(windows) {
+        return Err("cross-compiling between operating systems; CUDA needs a native build".into());
     }
-    if t.windows != cfg!(windows) || (t.windows && !t.msvc) {
-        return None;
+    if t.windows && !t.msvc {
+        return Err("CUDA on Windows needs the MSVC toolchain (rustup default stable-x86_64-pc-windows-msvc)".into());
     }
-    let mut cands: Vec<PathBuf> = std::env::var_os("CUDA_PATH").map(PathBuf::from).into_iter().collect();
+    let env = std::env::var_os("CUDA_PATH").map(PathBuf::from);
     if t.windows {
-        return cands.into_iter().find(|p| p.join("bin/nvcc.exe").exists() && p.join("lib/x64/cudart_static.lib").exists());
+        let Some(p) = env else {
+            return Err("CUDA_PATH is not set; install the CUDA Toolkit, then build from a new terminal".into());
+        };
+        for f in ["bin/nvcc.exe", "lib/x64/cudart_static.lib"] {
+            if !p.join(f).exists() {
+                return Err(format!("{} is missing (CUDA_PATH={})", p.join(f).display(), p.display()));
+            }
+        }
+        return Ok(p);
     }
+    let mut cands: Vec<PathBuf> = env.into_iter().collect();
     cands.extend(["/opt/cuda", "/usr/local/cuda"].map(PathBuf::from));
     cands.into_iter().find(|p| p.join("bin/nvcc").exists() && p.join("lib64/libcudart_static.a").exists())
+        .ok_or_else(|| "no CUDA Toolkit found (CUDA_PATH, /opt/cuda, /usr/local/cuda)".into())
 }
 
 fn main() {
@@ -47,9 +58,21 @@ fn main() {
     ];
     let portable = portable();
     let t = target();
-    let cuda = find_cuda(&t);
+    let cuda = if std::env::var_os("NZIP_NO_CUDA").is_some() {
+        None
+    } else {
+        match find_cuda(&t) {
+            Ok(p) => Some(p),
+            Err(why) if std::env::var_os("NZIP_REQUIRE_CUDA").is_some() => panic!("NZIP_REQUIRE_CUDA is set but {why}"),
+            Err(why) => {
+                println!("cargo:warning=building WITHOUT GPU support: {why}");
+                None
+            }
+        }
+    };
     println!("cargo:rustc-check-cfg=cfg(bsc_cuda)");
     println!("cargo:rerun-if-env-changed=NZIP_NO_CUDA");
+    println!("cargo:rerun-if-env-changed=NZIP_REQUIRE_CUDA");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=NZIP_PORTABLE");
 

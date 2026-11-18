@@ -126,6 +126,9 @@ enum Cmd {
     /// Show the container layout
     #[command(alias = "i", short_flag = 'i', long_flag = "info")]
     Info { input: PathBuf },
+    /// Show whether this build and machine can use the GPU, and its free memory
+    #[command(long_flag = "gpu")]
+    Gpu,
 }
 
 fn parse_size(s: &str) -> Result<usize, String> {
@@ -465,6 +468,11 @@ fn main() -> Result<()> {
                 eprintln!("{}{} -> {}: {} -> {} bytes ({:.3} bits/byte), {:.1} MB/s [{dev}]",
                     input.display(), if is_dir { " (folder)" } else { "" }, out_path.display(), data.len(), comp_len,
                     if data.is_empty() { 0.0 } else { 8.0 * comp_len as f64 / data.len() as f64 }, mbps(data.len(), secs));
+                if matches!(opt.mode, Mode::Max) && !matches!(device, DeviceArg::Cpu) && data.len() >= 64 << 20 {
+                    if let Some(note) = gpu_note() {
+                        eprintln!("nzip: {note}");
+                    }
+                }
             }
         }
         Cmd::Decompress { input, output, threads, device, memory, force, quiet } => {
@@ -527,6 +535,7 @@ fn main() -> Result<()> {
             };
             println!("OK: {} bytes verified, {:.1} MB/s", n, mbps(n as usize, t.elapsed().as_secs_f64()));
         }
+        Cmd::Gpu => print_gpu(),
         Cmd::Info { input } => {
             let data: &[u8] = &read_input(&input)?;
             let (fh, frames) = nzip::info(data)?;
@@ -553,6 +562,53 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// CUDA version number (e.g. 13010) as text ("13.1").
+fn cuda_ver(v: i32) -> String {
+    format!("{}.{}", v / 1000, v % 1000 / 10)
+}
+
+fn gb(b: usize) -> f64 {
+    b as f64 / 1e9
+}
+
+/// Why a max-mode run left (some of) its sorts to the CPU, if it did.
+fn gpu_note() -> Option<String> {
+    let s = nzip::gpu_status();
+    if !s.built {
+        return s.driver_found.then(|| "this nzip was built without GPU support, so it ran on the CPU only (see `nzip gpu`)".into());
+    }
+    if s.error != 0 || s.devices == 0 {
+        return s.driver_found.then(|| format!("GPU not used: {} (CUDA error {}; see `nzip gpu`)", nzip::cuda_error_text(s.error), s.error));
+    }
+    let (need, avail) = nzip::gpu_shortfall()?;
+    Some(format!("some blocks were sorted on the CPU: they needed {:.1} GB of free GPU memory and {:.1} GB was free. \
+        Close programs using the GPU, or use -b 512M (smaller blocks fit; slightly larger output).", gb(need), gb(avail)))
+}
+
+fn print_gpu() {
+    let s = nzip::gpu_status();
+    if !s.built {
+        println!("GPU code in this build: no (CPU-only build)");
+        println!("To use an NVIDIA GPU, build nzip from source with the CUDA Toolkit installed (see the README).");
+        return;
+    }
+    println!("GPU code in this build: yes (CUDA runtime {})", cuda_ver(s.runtime_cuda));
+    match (s.driver_found, s.driver_cuda) {
+        (false, _) => println!("NVIDIA driver: not found"),
+        (true, 0) => println!("NVIDIA driver: found"),
+        (true, v) => println!("NVIDIA driver: found, supports CUDA up to {}", cuda_ver(v)),
+    }
+    if s.error != 0 || s.devices == 0 {
+        println!("GPU: not usable: {} (CUDA error {})", nzip::cuda_error_text(s.error), s.error);
+        return;
+    }
+    println!("GPUs: {}", s.devices);
+    println!("GPU memory: {:.2} GB free of {:.2} GB", gb(s.free), gb(s.total));
+    let m = nzip::gpu_max_sort();
+    println!("Largest max-mode sort that fits now: {} MiB (each sorted byte needs ~21 bytes of GPU memory;", m >> 20);
+    println!("  a 1 GiB block usually shrinks to 550-750 MiB before the sort; bigger sorts run on the CPU)");
 }
 
 #[cfg(test)]

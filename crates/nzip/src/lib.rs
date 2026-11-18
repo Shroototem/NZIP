@@ -68,10 +68,23 @@ pub const NCORE_GPU_MIN: usize = 6 << 20;
 /// Max mode's block size when memory allows.
 pub const MAX_MODE_BLOCK: usize = 1 << 30;
 
-/// Whether a BWT block of `len` bytes fits in the GPU's free memory (libcubwt needs
-/// ~21 bytes per byte). Larger blocks are sorted on the CPU, with identical output.
-pub fn gpu_fits_block(len: usize) -> bool {
-    bsc_sys::gpu_free_memory().saturating_sub(256 << 20) / bsc_sys::GPU_BYTES_PER_BLOCK_BYTE >= len
+pub use bsc_sys::{cuda_error_text, GpuStatus};
+
+/// GPU support of this build and machine, for diagnostics.
+pub fn gpu_status() -> GpuStatus {
+    bsc_sys::gpu_status()
+}
+
+/// Largest max-mode sort (bytes after the LZP stage) that fits the GPU's free memory
+/// right now; larger ones run on the CPU, with identical output.
+pub fn gpu_max_sort() -> usize {
+    sched::max_gpu_sort()
+}
+
+/// If this run sorted some max-mode block on the CPU because the GPU lacked free memory:
+/// (largest memory need, memory available then), in bytes.
+pub fn gpu_shortfall() -> Option<(usize, usize)> {
+    sched::shortfall()
 }
 
 /// True if a usable GPU is present for nzip's GPU stages.

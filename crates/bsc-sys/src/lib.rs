@@ -102,6 +102,8 @@ unsafe extern "C" {
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     fn cudaFree(p: *mut std::ffi::c_void) -> c_int;
     fn cudaGetLastError() -> c_int;
+    fn cudaDriverGetVersion(v: *mut c_int) -> c_int;
+    fn cudaRuntimeGetVersion(v: *mut c_int) -> c_int;
 }
 
 /// True if a CUDA error is pending (and clears it if it isn't sticky). After a failed
@@ -156,19 +158,80 @@ pub fn gpu_warmup() {
     }
 }
 
+/// Result of `cudaGetDeviceCount` (CUDA error code, device count), asked once.
+#[cfg(bsc_cuda)]
+fn device_count() -> (c_int, c_int) {
+    static R: std::sync::OnceLock<(c_int, c_int)> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let mut n: c_int = 0;
+        let e = unsafe { cudaGetDeviceCount(&mut n) };
+        (e, n)
+    })
+}
+
 /// True if libbsc was built with CUDA and a usable NVIDIA GPU + driver is present.
 pub fn gpu_available() -> bool {
     #[cfg(bsc_cuda)]
     {
-        static GPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *GPU.get_or_init(|| {
-            let mut n: c_int = 0;
-            unsafe { cudaGetDeviceCount(&mut n) == 0 && n > 0 }
-        })
+        matches!(device_count(), (0, n) if n > 0)
     }
     #[cfg(not(bsc_cuda))]
     {
         false
+    }
+}
+
+/// Everything known about GPU support, for diagnostics (`nzip gpu`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuStatus {
+    /// This build contains the GPU code.
+    pub built: bool,
+    /// The NVIDIA user-mode driver is installed (nvcuda.dll / /dev/nvidiactl).
+    pub driver_found: bool,
+    /// Highest CUDA version the driver supports (e.g. 13010 = 13.1; 0 = unknown).
+    pub driver_cuda: i32,
+    /// CUDA runtime version built in (e.g. 13000 = 13.0).
+    pub runtime_cuda: i32,
+    /// `cudaGetDeviceCount` error code (0 = success).
+    pub error: i32,
+    pub devices: i32,
+    pub free: usize,
+    pub total: usize,
+}
+
+pub fn gpu_status() -> GpuStatus {
+    #[allow(unused_mut)]
+    let mut s = GpuStatus { built: built_with_gpu(), driver_found: nvidia_driver_present(), ..Default::default() };
+    #[cfg(bsc_cuda)]
+    unsafe {
+        let mut v: c_int = 0;
+        if cudaDriverGetVersion(&mut v) == 0 {
+            s.driver_cuda = v;
+        }
+        if cudaRuntimeGetVersion(&mut v) == 0 {
+            s.runtime_cuda = v;
+        }
+        (s.error, s.devices) = device_count();
+        if gpu_available() {
+            cudaMemGetInfo(&mut s.free, &mut s.total);
+        }
+    }
+    s
+}
+
+/// Plain-language meaning of the CUDA errors `cudaGetDeviceCount` can return.
+pub fn cuda_error_text(e: i32) -> &'static str {
+    match e {
+        0 => "ok",
+        3 => "CUDA failed to initialise",
+        34 => "only a stub CUDA driver library was found",
+        35 => "the NVIDIA driver is older than this build's CUDA runtime; update the driver",
+        46 => "the GPU is busy or in exclusive-process mode",
+        100 => "no CUDA-capable GPU was found",
+        101 => "invalid device (check CUDA_VISIBLE_DEVICES)",
+        803 | 804 => "the driver doesn't support this CUDA version on this GPU",
+        999 => "unknown CUDA error (a reboot after a driver update often fixes it)",
+        _ => "CUDA error",
     }
 }
 
