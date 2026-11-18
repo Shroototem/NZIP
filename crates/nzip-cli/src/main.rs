@@ -583,8 +583,8 @@ fn gpu_note() -> Option<String> {
         return s.driver_found.then(|| format!("GPU not used: {} (CUDA error {}; see `nzip gpu`)", nzip::cuda_error_text(s.error), s.error));
     }
     let (need, avail) = nzip::gpu_shortfall()?;
-    Some(format!("some blocks were sorted on the CPU: they needed {:.1} GB of free GPU memory and {:.1} GB was free. \
-        Close programs using the GPU, or use -b 512M (smaller blocks fit; slightly larger output).", gb(need), gb(avail)))
+    Some(format!("some blocks were sorted on the CPU: they needed {:.1} GB of free GPU memory and {:.1} GB was free \
+        (blocks are split for the GPU only into pieces of 64 MiB or more). Close programs using the GPU.", gb(need), gb(avail)))
 }
 
 fn print_gpu() {
@@ -608,7 +608,7 @@ fn print_gpu() {
     println!("GPU memory: {:.2} GB free of {:.2} GB", gb(s.free), gb(s.total));
     let m = nzip::gpu_max_sort();
     println!("Largest max-mode sort that fits now: {} MiB (each sorted byte needs ~21 bytes of GPU memory;", m >> 20);
-    println!("  a 1 GiB block usually shrinks to 550-750 MiB before the sort; bigger sorts run on the CPU)");
+    println!("  larger blocks are split into sub-blocks that fit, so any card size is used)");
 }
 
 #[cfg(test)]

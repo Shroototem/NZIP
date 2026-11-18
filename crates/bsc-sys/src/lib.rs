@@ -324,6 +324,23 @@ pub fn compress(input: &[u8], p: &Params) -> Result<Vec<u8>, BscError> {
     Ok(out)
 }
 
+/// (compressed size, original size) of the bsc block starting at `block`, from its header.
+pub fn block_info(block: &[u8]) -> Result<(usize, usize), BscError> {
+    init();
+    if block.len() < HEADER_SIZE {
+        return Err(BscError(-6));
+    }
+    let (mut bsize, mut dsize) = (0, 0);
+    let r = unsafe { bsc_block_info(block.as_ptr(), HEADER_SIZE as c_int, &mut bsize, &mut dsize, features(1)) };
+    if r != 0 {
+        return Err(BscError(r));
+    }
+    if (bsize as usize) < HEADER_SIZE || dsize < 0 {
+        return Err(BscError(-6));
+    }
+    Ok((bsize as usize, dsize as usize))
+}
+
 /// Decompress one bsc block into `out`, whose length must equal the original size.
 /// `gpu`: run the inverse BWT on the GPU (libbsc falls back to the CPU if it can't).
 pub fn decompress(block: &[u8], out: &mut [u8], threads: usize, gpu: bool) -> Result<(), BscError> {

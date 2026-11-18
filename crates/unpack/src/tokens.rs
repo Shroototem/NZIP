@@ -13,6 +13,8 @@ pub struct Tokens {
     /// Literal bytes (stored-block bytes included), in order.
     pub lits: Vec<u8>,
     /// Copy records: varint literals-before, length - 3 (one byte), varint distance.
+    /// Distance 0 (impossible otherwise) marks length 258 written with the non-canonical
+    /// code 284 + 31; the real distance follows as another varint.
     pub copies: Vec<u8>,
     /// Block layout and stream tail.
     pub recipe: Vec<u8>,
@@ -108,12 +110,13 @@ pub fn split(d: &[u8], limit: usize) -> Option<(Tokens, usize)> {
                         if dist > out_len || out_len + len > limit {
                             return None;
                         }
-                        // Length 258 also has a (non-canonical) code 284 + 31; keep it exact.
-                        if len == 258 && i == 27 {
-                            return None;
-                        }
                         put_var(&mut copies, run);
                         copies.push((len - 3) as u8);
+                        // Length 258 also has a non-canonical code (284 + 31, which zlib
+                        // decodes); mark it with distance 0 so the rebuild uses it too.
+                        if len == 258 && i == 27 {
+                            put_var(&mut copies, 0);
+                        }
                         put_var(&mut copies, dist as u32);
                         run = 0;
                         n_copies += 1;
@@ -276,11 +279,15 @@ pub fn join(lits: &[u8], copies: &[u8], recipe: &[u8]) -> Option<Vec<u8>> {
                     lp += run;
                     let len = *copies.get(cp)? as usize + 3;
                     cp += 1;
-                    let dist = get_var(copies, &mut cp)? as usize;
+                    let mut dist = get_var(copies, &mut cp)? as usize;
+                    let mut c = lcode[len] as usize;
+                    if dist == 0 && len == 258 {
+                        c = 27; // non-canonical 284 + 31
+                        dist = get_var(copies, &mut cp)? as usize;
+                    }
                     if dist == 0 || dist > 32768 {
                         return None;
                     }
-                    let c = lcode[len] as usize;
                     let (code, l) = *lc.get(257 + c)?;
                     if l == 0 {
                         return None;
@@ -336,6 +343,33 @@ mod tests {
         let (t, used) = split(&d, 1 << 20).unwrap();
         assert_eq!(used, d.len());
         assert_eq!(t.lits, b"hello");
+        assert_eq!(join(&t.lits, &t.copies, &t.recipe).unwrap(), d);
+    }
+
+    /// Length 258 written as code 284 + 31 (accepted by zlib) must survive split/join.
+    #[test]
+    fn noncanonical_258() {
+        // Fixed block: literal 'a', copy 258 at distance 1 via the non-canonical code.
+        let mut copies = Vec::new();
+        put_var(&mut copies, 1);
+        copies.push(255);
+        put_var(&mut copies, 0);
+        put_var(&mut copies, 1);
+        let mut recipe = vec![1 | 4];
+        put_var(&mut recipe, 1);
+        put_var(&mut recipe, 0);
+        let d = (0..8u8)
+            .find_map(|tb| {
+                let mut r = recipe.clone();
+                r.extend_from_slice(&[0, tb]);
+                join(b"a", &copies, &r)
+            })
+            .unwrap();
+        let m = crate::inflate::measure(&d, 1 << 20, false).unwrap();
+        assert_eq!(m.out_len, 259);
+        let (t, used) = split(&d, 1 << 20).unwrap();
+        assert_eq!(used, d.len());
+        assert_eq!(t.copies, copies);
         assert_eq!(join(&t.lits, &t.copies, &t.recipe).unwrap(), d);
     }
 }

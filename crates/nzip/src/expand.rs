@@ -199,13 +199,14 @@ pub fn compress<W: Write + Seek>(input: &[u8], opt: &Options, w: &mut W, progres
     type Meta = Vec<(usize, usize, Vec<u8>)>; // per stream: lits len, copies len, recipe
     // One wave: split its streams into tokens, compress literals and copies.
     let job = |r: &std::ops::Range<usize>| -> Result<(Vec<u8>, Vec<u8>, Meta), Error> {
+        // `split` accepts exactly what pass 1's `measure` accepts (same parser rules; the
+        // only non-canonical deflate code, length 258 as 284 + 31, has its own record), so
+        // a failure here is a bug, reported as such.
         let toks: Vec<unpack::tokens::Tokens> = pool.install(|| streams[r.clone()].par_iter().map(|s| {
-            let (t, used) = unpack::tokens::split(&input[s.start..], ITEM_LIMIT)
-                .ok_or(Error::Codec("deflate stream failed to split on second pass".into()))?;
-            if s.start + used != s.end {
-                return Err(Error::Codec("deflate stream length changed".into()));
+            match unpack::tokens::split(&input[s.start..], ITEM_LIMIT) {
+                Some((t, used)) if s.start + used == s.end => Ok(t),
+                _ => Err(Error::Codec(format!("internal error: deflate stream at byte {} didn't split exactly", s.start))),
             }
-            Ok(t)
         }).collect::<Result<_, Error>>())?;
         let (mut lits, mut copies, mut meta) = (Vec::new(), Vec::new(), Vec::with_capacity(toks.len()));
         for t in toks {

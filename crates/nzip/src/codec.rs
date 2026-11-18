@@ -66,7 +66,21 @@ pub fn decompress(id: u8, payload: &[u8], out: &mut [u8], threads: usize, gpu: b
             let n = zstd::bulk::decompress_to_buffer(payload, out).map_err(|_| Error::Corrupt("zstd stream invalid"))?;
             if n != out.len() { Err(Error::Corrupt("zstd length mismatch")) } else { Ok(()) }
         }
-        CODEC_BSC => bsc_sys::decompress(payload, out, threads, gpu).map_err(|_| Error::Corrupt("bsc stream invalid")),
+        // One or more bsc blocks back to back (a frame whose sort didn't fit the encoding
+        // machine's GPU is split into sub-blocks that did), filling `out` in order.
+        CODEC_BSC => {
+            let bad = || Error::Corrupt("bsc stream invalid");
+            let (mut p, mut o) = (0, 0);
+            while p < payload.len() {
+                let (bs, ds) = bsc_sys::block_info(&payload[p..]).map_err(|_| bad())?;
+                if bs > payload.len() - p || ds > out.len() - o {
+                    return Err(bad());
+                }
+                bsc_sys::decompress(&payload[p..p + bs], &mut out[o..o + ds], threads, gpu).map_err(|_| bad())?;
+                (p, o) = (p + bs, o + ds);
+            }
+            if o == out.len() { Ok(()) } else { Err(bad()) }
+        }
         CODEC_NCORE => {
             // Decode straight into `out`. Any GPU failure falls back to the CPU reference.
             let gpu_ok = gpu && ncore::gpu::warmup() && {
@@ -110,5 +124,27 @@ pub fn looks_incompressible(data: &[u8]) -> bool {
     match zstd::bulk::compress(sample, 1) {
         Ok(c) => c.len() as f64 > 0.98 * n as f64,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bsc frame may hold several blocks back to back (GPU-sized sub-blocks).
+    #[test]
+    fn bsc_sub_blocks() {
+        let a: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8 ^ (i / 997) as u8).collect();
+        let b: Vec<u8> = b"sub-block two ".iter().cycle().take(200_000).copied().collect();
+        let p = bsc_sys::Params { threads: 1, ..Default::default() };
+        let mut payload = bsc_sys::compress(&a, &p).unwrap();
+        payload.extend(bsc_sys::compress(&b, &p).unwrap());
+        let mut out = vec![0u8; a.len() + b.len()];
+        decompress(CODEC_BSC, &payload, &mut out, 1, false).unwrap();
+        assert_eq!(&out[..a.len()], &a[..]);
+        assert_eq!(&out[a.len()..], &b[..]);
+        assert!(decompress(CODEC_BSC, &payload[..payload.len() - 1], &mut out, 1, false).is_err());
+        let mut short = vec![0u8; a.len()];
+        assert!(decompress(CODEC_BSC, &payload, &mut short, 1, false).is_err());
     }
 }

@@ -7,5 +7,4 @@ description = "Universal deflate unpacker: finds deflate streams anywhere and re
 
 [dependencies]
 
-rayon = "1.12.0"
 

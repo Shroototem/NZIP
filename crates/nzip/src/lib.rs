@@ -142,10 +142,11 @@ impl Options {
     /// Maximum block size for this run.
     ///
     /// Max mode always uses 1 GiB blocks, the best ratio (enwik9: 1.441 bpb at 128 MiB,
-    /// 1.356 at 512 MiB, 1.314 at 1 GiB), on every machine. Each block's sort runs on the
-    /// GPU when its LZP output fits the card's memory at that moment (~21 bytes per byte),
-    /// otherwise on the CPU, with identical bytes either way. Only a memory budget too
-    /// small for one block (~7 bytes per byte) shrinks it. Decoding needs no GPU.
+    /// 1.356 at 512 MiB, 1.314 at 1 GiB). Each block's sort runs on the GPU when its LZP
+    /// output fits the card's free memory (~21 bytes per byte); a block that doesn't is
+    /// split into sub-blocks that do (`sched::bsc_block`), so smaller cards trade a little
+    /// ratio for GPU speed. Only a memory budget too small for one block (~7 bytes per
+    /// byte) shrinks it. Any machine decodes any archive; decoding needs no GPU.
     pub fn max_block_size(&self, _gpu: bool) -> usize {
         let b = match (self.block_size, self.mode) {
             (0, Mode::Fast) => 4 << 20,

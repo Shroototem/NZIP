@@ -70,9 +70,8 @@ NVIDIA's CUDA compiler needs Microsoft's compiler on Windows, so a GPU-enabled W
    whether the build has GPU code, whether the driver works (with the CUDA error in
    plain words if not) and the largest block sort that fits the GPU's free memory.
 
-The GPU sorts a block only if it fits the free GPU memory (~21 bytes per byte), so on a
-16 GB card the default 1 GiB blocks are borderline: Windows and open programs (browsers,
-games, Discord) hold GPU memory too. After a max-mode run, nzip says when blocks went to
-the CPU for lack of memory; close GPU-heavy programs or use `-b 512M`.
+The GPU sort needs ~21 bytes of free GPU memory per byte. A block too big for the card's
+free memory is split into sub-blocks that fit, so any card size is used (smaller cards
+give slightly larger output). Archives decode on any machine, with or without a GPU.
 
 Third-party components and their licenses: see `THIRD_PARTY_NOTICES.md`.

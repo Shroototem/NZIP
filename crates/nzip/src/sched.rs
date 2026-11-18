@@ -98,14 +98,61 @@ fn cpu_stage<T>(total: usize, len: usize, f: impl FnOnce(usize) -> T) -> T {
     r
 }
 
-/// Compress one block with bsc in scheduled stages. Returns the bsc block and whether
-/// its sort ran on the GPU.
-pub fn bsc_block(data: &[u8], coder: i32, total: usize, gpu: bool) -> Result<(Vec<u8>, bool), bsc_sys::BscError> {
-    let p = |threads| Params { coder, threads, gpu: false, ..Default::default() };
+/// Smallest sub-block worth splitting a block into for the GPU: below this the ratio
+/// loss outweighs the speed (a card that small sorts whole blocks on the CPU).
+const MIN_PIECE: usize = 64 << 20;
+
+fn params(coder: i32, threads: usize) -> Params {
+    Params { coder, threads, gpu: false, ..Default::default() }
+}
+
+fn lzp(data: &[u8], coder: i32, total: usize) -> Result<Staged, bsc_sys::BscError> {
     trace("lzp start", data.len());
-    let mut s = cpu_stage(total, data.len(), |t| Staged::lzp(data, &p(t)))?;
+    let s = cpu_stage(total, data.len(), |t| Staged::lzp(data, &params(coder, t)))?;
+    trace("lzp done", s.sort_len());
+    Ok(s)
+}
+
+/// Compress one block with bsc in scheduled stages. Returns the bsc data and whether a
+/// sort ran on the GPU.
+///
+/// Blocks are as large as memory allows (best ratio). When a block's sort doesn't fit
+/// the GPU's memory, it is split into equal sub-blocks that do, each a complete bsc
+/// block, back to back in the frame: any card size keeps the GPU busy, and any machine
+/// (GPU or CPU) decodes the result.
+pub fn bsc_block(data: &[u8], coder: i32, total: usize, gpu: bool) -> Result<(Vec<u8>, bool), bsc_sys::BscError> {
+    let s = lzp(data, coder, total)?;
     let n = s.sort_len();
-    trace("lzp done", n);
+    if gpu && n >= 1 << 20 && !GPU_OFF.load(Acquire) && !fits(n) {
+        // Pieces sized from the LZP output, with slack for uneven LZP gains.
+        let cap = max_gpu_sort() * 9 / 10;
+        let k = n.div_ceil(cap.max(1));
+        if cap >= MIN_PIECE && k >= 2 {
+            drop(s);
+            let piece = data.len().div_ceil(k);
+            // Pieces run concurrently: one sorts on the GPU while others do LZP/coding.
+            let parts: Vec<_> = std::thread::scope(|sc| {
+                let hs: Vec<_> = data.chunks(piece)
+                    .map(|c| sc.spawn(move || lzp(c, coder, total).and_then(|s| sort_and_code(c, s, coder, total, gpu))))
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("bsc piece")).collect()
+            });
+            let (mut out, mut any) = (Vec::new(), false);
+            for r in parts {
+                let (b, g) = r?;
+                out.extend_from_slice(&b);
+                any |= g;
+            }
+            return Ok((out, any));
+        }
+    }
+    sort_and_code(data, s, coder, total, gpu)
+}
+
+/// Sort (GPU if it fits and is quicker, else CPU) and entropy-code one bsc block.
+fn sort_and_code(data: &[u8], mut s: Staged, coder: i32, total: usize, gpu: bool) -> Result<(Vec<u8>, bool), bsc_sys::BscError> {
+    let p = |threads| params(coder, threads);
+    let n = s.sort_len();
     let mut on_gpu = false;
     let eligible = gpu && n >= 1 << 20 && !GPU_OFF.load(Acquire);
     if eligible && !fits(n) && SHORT_SORT.fetch_max(n, Relaxed) < n {
