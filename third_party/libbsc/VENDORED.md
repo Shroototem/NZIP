@@ -1,0 +1,1 @@
+Vendored from https://github.com/IlyaGrebnov/libbsc commit 131f440 (v3.4.0), including libcubwt (GPU BWT). CUDA parts are compiled only when nvcc is available; the library falls back to CPU at runtime when no GPU is present.

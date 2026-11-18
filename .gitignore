@@ -1,0 +1,12 @@
+# Sandbox: toolchains, Python env, caches, scratch (recreated locally)
+/.sandbox/
+# Build output
+/target/
+# Packages built by scripts/build-dist.sh and scripts/build-windows.sh
+/dist/
+# Benchmark and training data (large, downloaded)
+/data/
+# Trained model checkpoints and logs
+/models/
+# Archives made from this repo
+*.nz
