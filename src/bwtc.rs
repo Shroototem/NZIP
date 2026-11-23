@@ -9,33 +9,11 @@
 //! integer arithmetic coder. One generic function drives both encoder and decoder, so the
 //! two can never disagree.
 
-use crate::coder::{Decoder, Encoder};
+use crate::coder::{BitIo, Decoder, Dual, Encoder};
 use crate::mixer::{Mixer, knob};
 use crate::tables::{squash, stretch};
 
 const O2_BITS: usize = 16;
-
-/// Two probabilities on one context: one adapts fast (rate 1/8), one slowly (1/128).
-/// Pure shifts: cheap, and identical on every CPU.
-#[derive(Clone, Copy)]
-struct Dual([u16; 2]);
-
-impl Dual {
-    const INIT: Dual = Dual([32768; 2]);
-    #[inline(always)]
-    fn add(self, m: &mut Mixer) {
-        m.add(stretch(self.0[0] as i32 >> 4));
-        m.add(stretch(self.0[1] as i32 >> 4));
-    }
-    #[inline(always)]
-    fn update(&mut self, y: u32, fast: u32, slow: u32) {
-        let t = ((y << 16) - y) as i32;
-        let a = self.0[0] as i32;
-        let b = self.0[1] as i32;
-        self.0[0] = (a + ((t - a) >> fast)) as u16;
-        self.0[1] = (b + ((t - b) >> slow)) as u16;
-    }
-}
 
 struct Apm {
     t: Vec<u16>,
@@ -67,27 +45,6 @@ impl Apm {
         let g = ((y << 16) + (y << R) - y - y) as i32;
         let v = self.t[self.idx] as i32;
         self.t[self.idx] = (v + ((g - v) >> R)) as u16;
-    }
-}
-
-/// Encoder or decoder behind one interface.
-trait BitIo {
-    /// Codes `bit` (ignored when decoding) with P(1) = p/65536; returns the actual bit.
-    fn code(&mut self, bit: u32, p: u32) -> u32;
-}
-
-impl BitIo for Encoder {
-    #[inline(always)]
-    fn code(&mut self, bit: u32, p: u32) -> u32 {
-        self.encode(bit, p);
-        bit
-    }
-}
-
-impl BitIo for Decoder<'_> {
-    #[inline(always)]
-    fn code(&mut self, _bit: u32, p: u32) -> u32 {
-        self.decode(p)
     }
 }
 

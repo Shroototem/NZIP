@@ -1,9 +1,7 @@
 # Sandbox: toolchains, Python env, caches, scratch (recreated locally)
 /.sandbox/
-# Build output
+# Build output (packages from scripts/build-*.sh land in target/dist)
 /target/
-# Packages built by scripts/build-linux.sh and scripts/build-windows.sh
-/dist/
 # Benchmark and training data (large, downloaded)
 /data/
 # Trained model checkpoints and logs

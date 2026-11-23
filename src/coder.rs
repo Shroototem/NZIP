@@ -1,6 +1,9 @@
 //! Binary arithmetic coder (32-bit, carry-less). Probabilities are 16-bit integers, so the
 //! coder works the same on every machine.
 
+use crate::mixer::Mixer;
+use crate::tables::stretch;
+
 pub struct Encoder {
     x1: u32,
     x2: u32,
@@ -85,3 +88,47 @@ impl<'a> Decoder<'a> {
         self.pos > self.src.len() + 4
     }
 }
+
+/// Encoder or decoder behind one interface.
+pub trait BitIo {
+    /// Codes `bit` (ignored when decoding) with P(1) = p/65536; returns the actual bit.
+    fn code(&mut self, bit: u32, p: u32) -> u32;
+}
+
+impl BitIo for Encoder {
+    #[inline(always)]
+    fn code(&mut self, bit: u32, p: u32) -> u32 {
+        self.encode(bit, p);
+        bit
+    }
+}
+
+impl BitIo for Decoder<'_> {
+    #[inline(always)]
+    fn code(&mut self, _bit: u32, p: u32) -> u32 {
+        self.decode(p)
+    }
+}
+
+/// Two probabilities on one context: one adapts fast (rate 1/8), one slowly (1/128).
+/// Pure shifts: cheap, and identical on every CPU.
+#[derive(Clone, Copy)]
+pub struct Dual(pub [u16; 2]);
+
+impl Dual {
+    pub const INIT: Dual = Dual([32768; 2]);
+    #[inline(always)]
+    pub fn add(self, m: &mut Mixer) {
+        m.add(stretch(self.0[0] as i32 >> 4));
+        m.add(stretch(self.0[1] as i32 >> 4));
+    }
+    #[inline(always)]
+    pub fn update(&mut self, y: u32, fast: u32, slow: u32) {
+        let t = ((y << 16) - y) as i32;
+        let a = self.0[0] as i32;
+        let b = self.0[1] as i32;
+        self.0[0] = (a + ((t - a) >> fast)) as u16;
+        self.0[1] = (b + ((t - b) >> slow)) as u16;
+    }
+}
+

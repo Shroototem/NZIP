@@ -5,7 +5,8 @@
 //! block  : kind:u8 raw_len:varint comp_len:varint crc32:u32le payload[comp_len]
 //! end    : kind = 0
 //! BWT payload : flags:u8 (1 = word transform, 2 = x86 filter) bwt_len:varint idx[k]:u32le coder-stream
-//! LZ payload  : lz-stream
+//! LZ payload  : lz-stream (fast mode)
+//! LZX payload : flags:u8 (1 = x86 split) [4 raw lens, 4 comp lens] lzx stream(s) (max mode, binary)
 //! ```
 //! Input is read in waves of blocks; each wave is compressed in parallel and written in
 //! order, so memory stays bounded for any input size. Blocks are independent: the decoder
@@ -23,6 +24,7 @@ const KIND_END: u8 = 0;
 const KIND_STORED: u8 = 1;
 const KIND_BWT: u8 = 4;
 const KIND_LZ: u8 = 5;
+const KIND_LZX: u8 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -161,48 +163,127 @@ fn pack_block(data: &[u8], mode: Mode, threads: usize) -> Packed {
     }
     let (kind, out, note) = match mode {
         Mode::Fast => (KIND_LZ, crate::lz::compress(data), "lz"),
-        Mode::Max => {
-            let mut flags = 0u8;
-            let mut note = "bwt";
-            let t = if crate::textx::looks_like_text(data) {
-                match crate::textx::encode(data, threads) {
-                    Some(t) if t.len() * 100 < data.len() * 95 => {
-                        flags |= 1;
-                        note = "text+bwt";
-                        Some(t)
-                    }
-                    _ => None,
-                }
-            } else if crate::x86::looks_like_x86(data) {
-                let mut t = data.to_vec();
-                crate::x86::encode(&mut t);
-                flags |= 2;
-                note = "x86+bwt";
-                Some(t)
-            } else {
-                None
-            };
-            let src: &[u8] = t.as_deref().unwrap_or(data);
-            trace("transform done", src.len());
-            let (b, idx) = crate::gpu::bwt(src);
-            let src_len = src.len();
-            trace("bwt done", src_len);
-            let mut out = Vec::with_capacity(src.len() / 3 + 64);
-            out.push(flags);
-            write_varint(&mut out, src.len() as u64);
-            for i in idx {
-                out.extend_from_slice(&i.to_le_bytes());
-            }
-            drop(t);
-            out.extend_from_slice(&crate::bwtc::encode(&b, threads));
-            trace("coded", src_len);
-            (KIND_BWT, out, note)
-        }
+        Mode::Max => pack_max(data, threads),
     };
     if out.len() >= data.len() {
         return stored(data, crc, "expanded");
     }
     Packed { kind, raw_len: data.len(), crc, data: out, note }
+}
+
+/// BWT payload: flags, length, chain indices, coder stream.
+fn bwt_payload(src: &[u8], flags: u8, threads: usize) -> Vec<u8> {
+    trace("transform done", src.len());
+    let (b, idx) = crate::gpu::bwt(src);
+    trace("bwt done", src.len());
+    let mut out = Vec::with_capacity(src.len() / 3 + 64);
+    out.push(flags);
+    write_varint(&mut out, src.len() as u64);
+    for i in idx {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out.extend_from_slice(&crate::bwtc::encode(&b, threads));
+    trace("coded", src.len());
+    out
+}
+
+/// LZ payload: flags (1 = x86 split) then either one LZ stream, or the four split streams
+/// (raw lengths, compressed lengths, data).
+fn lz_payload(data: &[u8], x86: bool, threads: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    if x86 {
+        let sp = crate::x86::split(data);
+        let streams = [&sp.main, &sp.flags, &sp.addr, &sp.jump];
+        let coded: Vec<Vec<u8>> = streams.iter().map(|s| crate::lzx::encode(s, threads, false)).collect();
+        out.push(1);
+        for s in streams {
+            write_varint(&mut out, s.len() as u64);
+        }
+        for c in &coded {
+            write_varint(&mut out, c.len() as u64);
+        }
+        for c in coded {
+            out.extend_from_slice(&c);
+        }
+    } else {
+        out.push(0);
+        out.extend_from_slice(&crate::lzx::encode(data, threads, false));
+    }
+    out
+}
+
+/// Evenly spread slices of a big block, used to pick an engine cheaply.
+fn sample_of(data: &[u8]) -> Vec<u8> {
+    const SLICES: usize = 4;
+    const SLICE: usize = 256 << 10;
+    let step = data.len() / SLICES;
+    let mut s = Vec::with_capacity(SLICES * SLICE);
+    for i in 0..SLICES {
+        s.extend_from_slice(&data[i * step..(i * step + SLICE).min(data.len())]);
+    }
+    s
+}
+
+/// Max mode: text -> word transform + BWT. Anything else -> the BWT engine or the LZ engine,
+/// whichever codes a sample of the block (or the whole block, if small) smaller.
+fn pack_max(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
+    if crate::textx::looks_like_text(data) {
+        if let Some(t) = crate::textx::encode(data, threads) {
+            if t.len() * 100 < data.len() * 95 {
+                return (KIND_BWT, bwt_payload(&t, 1, threads), "text+bwt");
+            }
+        }
+        return (KIND_BWT, bwt_payload(data, 0, threads), "bwt");
+    }
+    let x86 = crate::x86::looks_like_x86(data);
+    let bwt_full = |d: &[u8]| -> Vec<u8> {
+        if x86 {
+            let mut t = d.to_vec();
+            crate::x86::encode(&mut t);
+            bwt_payload(&t, 2, threads)
+        } else {
+            bwt_payload(d, 0, threads)
+        }
+    };
+    if data.len() <= 2 << 20 {
+        let b = bwt_full(data);
+        let l = lz_payload(data, x86, threads);
+        return if l.len() < b.len() { (KIND_LZX, l, if x86 { "x86+lz" } else { "lz" }) } else { (KIND_BWT, b, if x86 { "x86+bwt" } else { "bwt" }) };
+    }
+    let s = sample_of(data);
+    let sb = bwt_full(&s).len();
+    let sl = lz_payload(&s, x86, threads).len();
+    trace(if sl <= sb { "engine: lz" } else { "engine: bwt" }, data.len());
+    if sl <= sb {
+        (KIND_LZX, lz_payload(data, x86, threads), if x86 { "x86+lz" } else { "lz" })
+    } else {
+        (KIND_BWT, bwt_full(data), if x86 { "x86+bwt" } else { "bwt" })
+    }
+}
+
+fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
+    let e = || "corrupt LZ block".to_string();
+    let flags = *p.first().ok_or_else(e)?;
+    let mut r = &p[1..];
+    if flags & 1 == 0 {
+        return crate::lzx::decode(r, raw_len, threads, false);
+    }
+    let mut raw = [0usize; 4];
+    let mut comp = [0usize; 4];
+    for v in raw.iter_mut().chain(comp.iter_mut()) {
+        *v = read_varint(&mut r).map_err(|_| e())? as usize;
+    }
+    if raw.iter().any(|&l| l > raw_len.max(1 << 16) * 2) {
+        return Err(e());
+    }
+    let mut streams = Vec::with_capacity(4);
+    let mut off = 0usize;
+    for i in 0..4 {
+        let c = r.get(off..off + comp[i]).ok_or_else(e)?;
+        off += comp[i];
+        streams.push(crate::lzx::decode(c, raw[i], threads, false)?);
+    }
+    crate::x86::join(&streams[0], &streams[1], &streams[2], &streams[3], raw_len)
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -367,6 +448,7 @@ fn unpack_block(b: &Raw, threads: usize) -> io::Result<Vec<u8>> {
         KIND_STORED => b.data.clone(),
         KIND_BWT => unpack_bwt(&b.data, b.raw_len, threads).map_err(|e| bad(&e))?,
         KIND_LZ => crate::lz::decompress(&b.data, b.raw_len).map_err(|e| bad(&e))?,
+        KIND_LZX => unpack_lz(&b.data, b.raw_len, threads).map_err(|e| bad(&e))?,
         _ => return Err(bad("unknown block kind")),
     };
     if out.len() != b.raw_len || crc32(&out) != b.crc {

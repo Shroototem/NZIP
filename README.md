@@ -93,8 +93,8 @@ context-mixed coding for binary blocks.
 
 ```
 cargo build --release              # Linux; output target/release/nzip
-scripts/build-linux.sh             # dist/nzip-<ver>-linux-x86_64.tar.gz
-scripts/build-windows.sh           # cross-build dist/nzip-<ver>-windows-x86_64.zip
+scripts/build-linux.sh             # target/dist/nzip-<ver>-linux-x86_64.tar.gz
+scripts/build-windows.sh           # cross-build target/dist/nzip-<ver>-windows-x86_64.zip
 scripts/build-ptx.sh               # only after editing gpu/sa.cu (needs nvcc)
 cargo test --release               # unit tests (GPU test is skipped without a GPU)
 ```

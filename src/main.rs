@@ -2,11 +2,13 @@
 
 mod archive;
 mod bwtc;
+mod cm;
 mod codec;
 mod coder;
 mod container;
 mod gpu;
 mod lz;
+mod lzx;
 mod mixer;
 mod par;
 mod sais;
@@ -236,6 +238,57 @@ fn run(a: Args) -> io::Result<()> {
                 data.len(), c.len(),
                 (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(),
                 (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64()
+            );
+        }
+        "lzsize" => {
+            // dev: LZ engine on one file (x86 filter if detected), with timings
+            let mut data = std::fs::read(need_input()?)?;
+            let orig = data.clone();
+            let x86 = x86::looks_like_x86(&data) && std::env::var_os("NOX86").is_none();
+            if x86 {
+                x86::encode(&mut data);
+            }
+            let t0 = Instant::now();
+            let c = lzx::encode(&data, a.threads, x86);
+            let t1 = Instant::now();
+            let mut d = lzx::decode(&c, data.len(), a.threads, x86).unwrap();
+            let t2 = Instant::now();
+            if x86 {
+                x86::decode(&mut d);
+            }
+            assert!(d == orig, "LZ round trip failed");
+            println!(
+                "{} -> {} (x86 {}) | c {:.2}s {:.1} MB/s | d {:.2}s {:.1} MB/s",
+                orig.len(), c.len(), x86,
+                (t1 - t0).as_secs_f64(), orig.len() as f64 / 1e6 / (t1 - t0).as_secs_f64(),
+                (t2 - t1).as_secs_f64(), orig.len() as f64 / 1e6 / (t2 - t1).as_secs_f64()
+            );
+        }
+        "lzsplit" => {
+            // dev: x86 split streams, each through the LZ engine
+            let data = std::fs::read(need_input()?)?;
+            let t0 = Instant::now();
+            let sp = x86::split(&data);
+            let cm = lzx::encode(&sp.main, a.threads, false);
+            let cf = lzx::encode(&sp.flags, a.threads, false);
+            let ca = lzx::encode(&sp.addr, a.threads, false);
+            let cj = lzx::encode(&sp.jump, a.threads, false);
+            let t1 = Instant::now();
+            if std::env::var_os("NZ_ENCONLY").is_some() {
+                println!("{} -> {} (main {}) | c {:.2}s", data.len(), cm.len() + cf.len() + ca.len() + cj.len(), cm.len(), (t1 - t0).as_secs_f64());
+                return Ok(());
+            }
+            let m = lzx::decode(&cm, sp.main.len(), a.threads, false).unwrap();
+            let f = lzx::decode(&cf, sp.flags.len(), a.threads, false).unwrap();
+            let ad = lzx::decode(&ca, sp.addr.len(), a.threads, false).unwrap();
+            let jd = lzx::decode(&cj, sp.jump.len(), a.threads, false).unwrap();
+            let back = x86::join(&m, &f, &ad, &jd, data.len()).unwrap();
+            let t2 = Instant::now();
+            assert!(back == data);
+            println!(
+                "{} -> {} (main {} -> {}, flags {} -> {}, call {} -> {}, jump {} -> {}) | c {:.2}s | d {:.2}s",
+                data.len(), cm.len() + cf.len() + ca.len() + cj.len(), sp.main.len(), cm.len(), sp.flags.len(), cf.len(), sp.addr.len(), ca.len(), sp.jump.len(), cj.len(),
+                (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64()
             );
         }
         "info" => {
