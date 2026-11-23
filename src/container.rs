@@ -19,7 +19,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -116,8 +116,11 @@ pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
                     even(by_vram.min(ram / 7).min(MAX_BLOCK as u64))
                 }
                 _ => {
-                    let per = total.div_ceil(threads);
-                    let by_ram = (ram / (7 * threads)).max(8 << 20);
+                    // both engines run every core inside one block (coder segments, LZ
+                    // pieces), so a block is never cut below 32 MB just to feed threads:
+                    // small blocks cost 10-25% on mid-size files
+                    let per = total.div_ceil(threads).max(32 << 20);
+                    let by_ram = (ram / 7).max(8 << 20);
                     even(per.min(by_ram).min(CPU_BLOCK as u64))
                 }
             }
@@ -239,23 +242,34 @@ fn sample_of(data: &[u8]) -> Vec<u8> {
 /// Max mode: text -> word transform + BWT. Anything else -> the BWT engine or the LZ engine,
 /// whichever codes a sample of the block (or the whole block, if small) smaller.
 fn pack_max(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
-    if let Some(pieces) = crate::mix::zip_pieces(data) {
-        return (KIND_MIX, mix_payload(data, &pieces, threads), "zip split");
+    use crate::mix::{BIN, Piece, RAW, TEXT};
+    let zip = crate::mix::zip_pieces(data);
+    if zip.is_none() && crate::textx::looks_like_text(data) {
+        return pack_plain(data, threads);
     }
-    pack_plain(data, threads)
+    let base = zip.unwrap_or_else(|| vec![Piece { len: data.len(), kind: BIN }]);
+    let pieces = crate::mix::raw_split(data, &base, threads);
+    let has = |k: u8| pieces.iter().any(|p| p.kind == k);
+    if !has(RAW) && !has(TEXT) {
+        return pack_plain(data, threads);
+    }
+    if !has(BIN) && !has(TEXT) {
+        return (KIND_STORED, data.to_vec(), "incompressible");
+    }
+    (KIND_MIX, mix_payload(data, &pieces, threads), if has(TEXT) { "zip split" } else { "raw split" })
 }
 
-/// Mixed block: text pieces and binary pieces packed apart (see mix.rs).
+/// Mixed block: text, binary and raw pieces packed apart (see mix.rs).
 fn mix_payload(data: &[u8], pieces: &[crate::mix::Piece], threads: usize) -> Vec<u8> {
-    let (t, o) = crate::mix::gather(data, pieces);
-    let parts = [t, o];
+    let parts = crate::mix::gather(data, pieces);
     let packed = par::map(&parts, 2, |p| if p.is_empty() { (KIND_STORED, Vec::new(), "") } else { pack_plain(p, threads) });
     let tab = crate::mix::write_table(pieces);
     let mut out = Vec::with_capacity(tab.len() + packed.iter().map(|p| p.1.len() + 16).sum::<usize>());
     write_varint(&mut out, tab.len() as u64);
     out.extend_from_slice(&tab);
-    for (raw, (kind, payload, _)) in parts.iter().zip(packed) {
-        let (kind, payload) = if payload.len() >= raw.len() { (KIND_STORED, raw.clone()) } else { (kind, payload) };
+    for (i, (raw, (kind, payload, _))) in parts.iter().zip(packed).enumerate() {
+        let (kind, payload) =
+            if i == crate::mix::RAW as usize || payload.len() >= raw.len() { (KIND_STORED, raw.clone()) } else { (kind, payload) };
         out.push(kind);
         write_varint(&mut out, raw.len() as u64);
         write_varint(&mut out, payload.len() as u64);
@@ -270,8 +284,8 @@ fn unpack_mix(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
     let tl = read_varint(&mut r).map_err(|_| e())? as usize;
     let pieces = crate::mix::read_table(r.get(..tl).ok_or_else(e)?, raw_len)?;
     r = &r[tl..];
-    let mut parts = Vec::with_capacity(2);
-    for _ in 0..2 {
+    let mut parts = Vec::with_capacity(3);
+    for _ in 0..3 {
         let kind = read_u8(&mut r).map_err(|_| e())?;
         let n = read_varint(&mut r).map_err(|_| e())? as usize;
         let c = read_varint(&mut r).map_err(|_| e())? as usize;
@@ -281,8 +295,8 @@ fn unpack_mix(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
         parts.push((kind, n, r.get(..c).ok_or_else(e)?));
         r = &r[c..];
     }
-    let out = par::map(&parts, 2, |&(kind, n, c)| unpack_payload(kind, c, n, threads)).into_iter().collect::<Result<Vec<_>, _>>()?;
-    crate::mix::scatter(&out[0], &out[1], &pieces)
+    let out = par::map(&parts, 3, |&(kind, n, c)| unpack_payload(kind, c, n, threads)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    crate::mix::scatter(&out, &pieces)
 }
 
 /// One engine for the whole block.

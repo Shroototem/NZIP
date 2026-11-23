@@ -124,6 +124,7 @@ struct Kernels {
     mf_prev: *mut c_void,
     mf_count: *mut c_void,
     mf_pack: *mut c_void,
+    lz_parse: *mut c_void,
 }
 
 struct Gpu {
@@ -225,6 +226,7 @@ unsafe fn init() -> Result<Gpu, String> {
             mf_prev: f("mf_prev")?,
             mf_count: f("mf_count")?,
             mf_pack: f("mf_pack")?,
+            lz_parse: f("lz_parse")?,
         };
         Ok(Gpu { api, ctx, k, name, disabled: false })
     }
@@ -545,6 +547,83 @@ impl Gpu {
         Ok((idx, m))
     }
 
+    /// Optimal parse of the 64 KiB segments [seg0, seg0 + nseg) of `s` (see lz_parse in
+    /// sa.cu). `idx`/`pairs` are the match lists of positions [ib, ib + idx.len() - 1), with
+    /// idx relative to `pairs`. Returns, per segment, None when it is dense (coded as
+    /// literals) or its tokens in order as (word, d).
+    #[allow(clippy::too_many_arguments)]
+    fn lz_parse(&self, s: &[u8], ib: usize, idx: &[u32], pairs: &[(u32, u32)], dense: &[bool], seg0: usize, nseg: usize, prices: &[LzPrices], lit: &[u16]) -> Result<Vec<Option<Vec<(u32, u32)>>>, String> {
+        let n = s.len();
+        let span = idx.len() - 1;
+        let up = |b: &Buf, src: *const c_void, len: usize| unsafe { ck((self.api.cuMemcpyHtoD_v2)(b.p, src, len), "upload") };
+        let text = self.alloc(n + 64)?;
+        up(&text, s.as_ptr() as *const c_void, n)?;
+        let di = self.alloc(idx.len() * 4)?;
+        up(&di, idx.as_ptr() as *const c_void, idx.len() * 4)?;
+        let dp = self.alloc(pairs.len() * 8)?;
+        if !pairs.is_empty() {
+            up(&dp, pairs.as_ptr() as *const c_void, pairs.len() * 8)?;
+        }
+        let fl: Vec<u8> = dense.iter().map(|&b| b as u8).collect();
+        let dd = self.alloc(fl.len())?;
+        up(&dd, fl.as_ptr() as *const c_void, fl.len())?;
+        let psz = std::mem::size_of::<LzPrices>() * prices.len();
+        let dpr = self.alloc(psz)?;
+        up(&dpr, prices.as_ptr() as *const c_void, psz)?;
+        let mut pstep = (prices.len() > 1) as u32;
+        let dl = self.alloc(lit.len() * 2)?;
+        up(&dl, lit.as_ptr() as *const c_void, lit.len() * 2)?;
+        let ba = self.alloc(span * 4)?;
+        let bd = self.alloc(span * 4)?;
+        let on = self.alloc(nseg * 4)?;
+        let (mut tp, mut n32, mut s0, mut ns, mut ib32) = (text.p, n as u32, seg0 as u32, nseg as u32, ib as u32);
+        let (mut ip, mut pp, mut dp_, mut prp, mut lp, mut bap, mut bdp, mut onp) = (di.p, dp.p, dd.p, dpr.p, dl.p, ba.p, bd.p, on.p);
+        const WARPS: u32 = 8;
+        self.launch_grid(
+            self.k.lz_parse,
+            (nseg as u32).div_ceil(WARPS),
+            32 * WARPS,
+            &mut [arg(&mut tp), arg(&mut n32), arg(&mut s0), arg(&mut ns), arg(&mut ib32), arg(&mut ip), arg(&mut pp), arg(&mut dp_), arg(&mut prp), arg(&mut pstep), arg(&mut lp), arg(&mut bap), arg(&mut bdp), arg(&mut onp)],
+        )?;
+        let mut a = vec![0u32; span];
+        let mut d = vec![0u32; span];
+        let mut flags = vec![0u32; nseg];
+        if std::env::var_os("NZIP_TRACE").is_some() {
+            let t0 = std::time::Instant::now();
+            unsafe { ck((self.api.cuCtxSynchronize)(), "lz_parse")? };
+            eprintln!("    lz_parse kernel: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        unsafe {
+            ck((self.api.cuCtxSynchronize)(), "lz_parse")?;
+            ck((self.api.cuMemcpyDtoH_v2)(a.as_mut_ptr() as *mut c_void, ba.p, span * 4), "download")?;
+            ck((self.api.cuMemcpyDtoH_v2)(d.as_mut_ptr() as *mut c_void, bd.p, span * 4), "download")?;
+            ck((self.api.cuMemcpyDtoH_v2)(flags.as_mut_ptr() as *mut c_void, on.p, nseg * 4), "download")?;
+        }
+        let mut out = Vec::with_capacity(nseg);
+        for k in 0..nseg {
+            if flags[k] != 0 {
+                out.push(None);
+                continue;
+            }
+            let st = ((seg0 + k) << 16) - ib;
+            let en = (((seg0 + k + 1) << 16).min(n)) - ib;
+            let mut toks = Vec::new();
+            let mut j = en;
+            while j > st {
+                let w = a[j - 1];
+                let l = (w & 511) as usize;
+                if l == 0 || l > j - st {
+                    return Err("GPU parse returned a broken chain".into());
+                }
+                toks.push((w, d[j - 1]));
+                j -= l;
+            }
+            toks.reverse();
+            out.push(Some(toks));
+        }
+        Ok(out)
+    }
+
     fn bwt(&self, s: &[u8]) -> Result<(Vec<u8>, Vec<u32>), String> {
         let n = s.len();
         let n32 = n as u32;
@@ -621,6 +700,50 @@ pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
         Ok(r) => {
             if std::env::var_os("NZIP_TRACE").is_some() {
                 eprintln!("  gpu match lists: {} MB in {:.3}s", s.len() >> 20, t0.elapsed().as_secs_f64());
+            }
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("nzip: GPU disabled for this run ({e}); using the CPU");
+            g.disabled = true;
+            None
+        }
+    }
+}
+
+/// Static LZ prices for the GPU parser, in 1/16 bit (layout = LzP in sa.cu).
+#[repr(C)]
+#[derive(Clone)]
+pub struct LzPrices {
+    pub lit_flag: [[u32; 4]; 12],
+    pub match_flag: [[u32; 4]; 12],
+    pub rep_flag: [[u32; 2]; 12],
+    pub rep0: [[u32; 2]; 12],
+    pub rep0long: [[[u32; 2]; 4]; 12],
+    pub rep1: [[u32; 2]; 12],
+    pub rep2: [[u32; 2]; 12],
+    pub mlen: [[u32; 272]; 4],
+    pub rlen: [[u32; 272]; 4],
+    pub slot: [[u32; 64]; 4],
+    pub small: [[u32; 128]; 4],
+    pub align: [u32; 16],
+}
+
+/// GPU optimal parse of whole 64 KiB segments (see `Gpu::lz_parse`), or None when no GPU
+/// can take it.
+#[allow(clippy::too_many_arguments)]
+pub fn lz_parse(s: &[u8], ib: usize, idx: &[u32], pairs: &[(u32, u32)], dense: &[bool], seg0: usize, nseg: usize, prices: &[LzPrices], lit: &[u16]) -> Option<Vec<Option<Vec<(u32, u32)>>>> {
+    let m = gpu()?;
+    let mut g = m.lock().unwrap();
+    if g.disabled {
+        return None;
+    }
+    unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
+    let t0 = std::time::Instant::now();
+    match g.lz_parse(s, ib, idx, pairs, dense, seg0, nseg, prices, lit) {
+        Ok(r) => {
+            if std::env::var_os("NZIP_TRACE").is_some() {
+                eprintln!("  gpu parse: {nseg} segments in {:.3}s", t0.elapsed().as_secs_f64());
             }
             Some(r)
         }

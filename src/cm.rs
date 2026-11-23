@@ -36,31 +36,6 @@ impl Ctr {
     }
 }
 
-/// Rates 1/(n + 1.5) for a counter seen n times.
-const RATE: [i32; 16] = {
-    let mut r = [0i32; 16];
-    let mut n = 0;
-    while n < 16 {
-        r[n] = (65536 * 2 / (2 * n as i32 + 3)) as i32;
-        n += 1;
-    }
-    r
-};
-
-impl Ctr {
-    /// Adaptive-rate update: the low 4 bits count updates (up to `lim` <= 15), the rate
-    /// starts fast and settles at 1/(lim + 1.5). Probability precision is 12 bits.
-    #[inline(always)]
-    pub fn update_n(&mut self, y: u32, lim: u32) {
-        let n = (self.p & 15) as usize;
-        let p = (self.p >> 4) as i32;
-        let t = if y == 1 { 4095 } else { 0 };
-        let p = p + (((t - p) * RATE[n]) >> 16);
-        let n = (n + 1).min(lim as usize);
-        self.p = ((p as u16) << 4) | n as u16;
-    }
-}
-
 /// Inputs and weights live in 8 lanes (unused lanes stay 0), so the dot product and the
 /// update compile to a few AVX2 instructions whatever `K` is; results equal K-lane math.
 #[derive(Clone)]

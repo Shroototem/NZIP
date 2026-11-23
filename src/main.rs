@@ -6,11 +6,11 @@ mod cm;
 mod codec;
 mod coder;
 mod container;
-mod dedup;
 mod gpu;
 mod lz;
 mod lzx;
 mod mix;
+mod outfile;
 mod mixer;
 mod par;
 mod progress;
@@ -23,7 +23,7 @@ mod x86;
 use container::{FLAG_DIR, Mode, Options};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const USAGE: &str = "\
@@ -80,7 +80,7 @@ fn parse() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     // a bare first word selects a developer command (lzsize, bwtsize, ...)
     let dev = match it.peek() {
-        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit" | "dedupsize" | "mixsize" | "lzstats") => it.next(),
+        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit" | "mixsize" | "lzstats") => it.next(),
         _ => None,
     };
     let mut a = Args {
@@ -151,11 +151,11 @@ fn mb(b: u64) -> f64 {
     b as f64 / 1e6
 }
 
-fn create_out(p: &Path, force: bool) -> io::Result<File> {
-    if !force && p.exists() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists (use -f to overwrite)", p.display())));
+fn check_len(n: u64, total: u64) -> io::Result<()> {
+    if n != total {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("size mismatch: {n} != {total}")));
     }
-    File::create(p)
+    Ok(())
 }
 
 fn run(a: Args) -> io::Result<()> {
@@ -164,15 +164,21 @@ fn run(a: Args) -> io::Result<()> {
     match a.cmd.as_str() {
         "c" | "compress" => {
             let input = need_input()?;
-            let out_path = a.output.clone().unwrap_or_else(|| {
-                let mut s = input.clone().into_os_string();
-                s.push(".nz");
-                s.into()
-            });
+            let out_path = match a.output.clone() {
+                Some(p) => p,
+                None => outfile::archive_name(&input)?,
+            };
             let t0 = Instant::now();
-            let out = BufWriter::with_capacity(1 << 20, create_out(&out_path, a.force)?);
+            let (guard, file) = outfile::OutFile::create(&out_path, a.force)?;
+            let mut out = BufWriter::with_capacity(1 << 20, file);
+            let mut dup_bytes = 0u64;
             let (src, total, flags, cuts): (Box<dyn io::Read>, u64, u8, Vec<u64>) = if input.is_dir() {
-                let entries = archive::scan(&input)?;
+                // never pack the archive being written, wherever -o puts it
+                let mut entries = archive::scan(&input, Some(guard.temp_path()))?;
+                dup_bytes = archive::find_dups(&mut entries, opts.threads)?;
+                if opts.verbose && dup_bytes > 0 {
+                    eprintln!("  duplicate files: {dup_bytes} bytes stored once");
+                }
                 let (r, total, cuts) = archive::PackReader::new(&entries);
                 (Box::new(r), total, FLAG_DIR, cuts)
             } else {
@@ -181,19 +187,23 @@ fn run(a: Args) -> io::Result<()> {
                 (Box::new(f), total, 0, Vec::new())
             };
             let bar = progress::start("compressing", total, a.progress);
-            let st = container::compress(BufReader::with_capacity(1 << 20, src), total, flags, out, &opts, &cuts)?;
+            let st = container::compress(BufReader::with_capacity(1 << 20, src), total, flags, &mut out, &opts, &cuts)?;
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            guard.commit()?;
             drop(bar);
             let dt = t0.elapsed().as_secs_f64();
+            // real input size: duplicate files count although they are stored once
+            let in_bytes = st.in_bytes + dup_bytes;
             eprintln!(
                 "{} -> {}: {} -> {} bytes ({:.3}%, {:.4} bpb) in {:.2}s, {:.2} MB/s [{:?}, {} blocks (largest {} MB), {} threads]",
                 input.display(),
                 out_path.display(),
-                st.in_bytes,
+                in_bytes,
                 st.out_bytes,
-                st.out_bytes as f64 * 100.0 / st.in_bytes.max(1) as f64,
-                st.out_bytes as f64 * 8.0 / st.in_bytes.max(1) as f64,
+                st.out_bytes as f64 * 100.0 / in_bytes.max(1) as f64,
+                st.out_bytes as f64 * 8.0 / in_bytes.max(1) as f64,
                 dt,
-                mb(st.in_bytes) / dt,
+                mb(in_bytes) / dt,
                 opts.mode,
                 st.blocks,
                 st.largest.div_ceil(1 << 20),
@@ -210,21 +220,23 @@ fn run(a: Args) -> io::Result<()> {
             let n = if test {
                 container::decompress(r, &h, io::sink(), a.threads)?
             } else {
-                let out_path = a.output.clone().unwrap_or_else(|| {
-                    let s = input.to_string_lossy();
-                    PathBuf::from(s.strip_suffix(".nz").map(str::to_string).unwrap_or_else(|| format!("{s}.out")))
-                });
+                let out_path = a.output.clone().unwrap_or_else(|| outfile::unpack_name(&input));
                 if h.flags & FLAG_DIR != 0 {
-                    if !a.force && out_path.exists() {
-                        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists (use -f)", out_path.display())));
-                    }
-                    let mut u = archive::Unpacker::new(&out_path);
+                    let guard = outfile::OutDir::create(&out_path, a.force)?;
+                    let mut u = archive::Unpacker::new(guard.temp_path());
                     let n = container::decompress(r, &h, &mut u, a.threads)?;
                     u.finish()?;
+                    check_len(n, h.total)?;
+                    guard.commit()?;
                     n
                 } else {
-                    let out = BufWriter::with_capacity(1 << 20, create_out(&out_path, a.force)?);
-                    container::decompress(r, &h, out, a.threads)?
+                    let (guard, file) = outfile::OutFile::create(&out_path, a.force)?;
+                    let mut out = BufWriter::with_capacity(1 << 20, file);
+                    let n = container::decompress(r, &h, &mut out, a.threads)?;
+                    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+                    check_len(n, h.total)?;
+                    guard.commit()?;
+                    n
                 }
             };
             drop(bar);
@@ -308,8 +320,9 @@ fn run(a: Args) -> io::Result<()> {
                 println!("no split");
                 return Ok(());
             };
-            let (t, o) = mix::gather(&data, &p);
-            assert!(mix::scatter(&t, &o, &p).unwrap() == data);
+            let parts = mix::gather(&data, &p);
+            assert!(mix::scatter(&parts, &p).unwrap() == data);
+            let [t, o, _] = parts;
             let tab = mix::write_table(&p);
             assert!(mix::read_table(&tab, data.len()).unwrap() == p);
             if let Some(d) = std::env::var_os("NZ_DUMP") {
@@ -318,22 +331,6 @@ fn run(a: Args) -> io::Result<()> {
                 std::fs::write(PathBuf::from(&d).with_extension("tab"), &tab)?;
             }
             println!("{} -> text {} bin {} pieces {} table {}", data.len(), t.len(), o.len(), p.len(), tab.len());
-        }
-        "dedupsize" => {
-            // dev: long-range dedup; writes literals and records next to NZ_DUMP
-            let data = std::fs::read(need_input()?)?;
-            let min = std::env::var("NZ_L").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-            let t0 = Instant::now();
-            let (l, r) = dedup::split(&data, min);
-            let t1 = Instant::now();
-            let j = dedup::join(&l, &r, data.len(), min).unwrap();
-            let t2 = Instant::now();
-            assert!(j == data, "dedup round trip failed");
-            if let Some(p) = std::env::var_os("NZ_DUMP") {
-                std::fs::write(PathBuf::from(&p).with_extension("lits"), &l)?;
-                std::fs::write(PathBuf::from(&p).with_extension("recs"), &r)?;
-            }
-            println!("{} -> lits {} recs {} | split {:.2}s join {:.2}s", data.len(), l.len(), r.len(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64());
         }
         "lzsize" => {
             // dev: LZ engine on one file (x86 filter if detected), with timings
@@ -417,6 +414,7 @@ fn main() {
         }
         unsafe { prctl(0x5961_6d61, u64::MAX, 0, 0, 0) };
     }
+    outfile::install_handler();
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {
