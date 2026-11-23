@@ -75,7 +75,7 @@ a 4.3 GB peak. A machine with less RAM runs fewer blocks at once and gets the sa
 Compared with 7-Zip 26.06 LZMA2 Ultra (`-mx=9`, all threads; reference numbers are kept in
 [bench/7z-ultra.md](bench/7z-ultra.md)). nzip uses its default 99% of CPU threads.
 
-| Data | 7-Zip Ultra | nzip max | Size vs 7-Zip |
+| Data | 7-Zip LZMA2 Ultra | nzip max | Size vs 7-Zip |
 |---|---:|---:|---:|
 | enwik8 (100 MB text) | 24,799,463 · 40.3 s · 0.80 s | 21,187,957 · 1.2 s · 0.65 s | **−14.6%** |
 | enwik9 (1 GB text) | 210,604,362 · 212.5 s · 3.1 s | 177,404,158 · 5.9 s · 3.7 s | **−15.8%** |
