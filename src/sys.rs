@@ -6,6 +6,30 @@ pub fn cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// Asks Windows not to power-throttle this process: Windows 11 otherwise may run a
+/// console program whose window is not in front on efficiency cores at low clocks (Intel
+/// hybrid CPUs). Priority is not changed. No effect elsewhere.
+pub fn no_throttle() {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Throttle {
+            version: u32,
+            control_mask: u32,
+            state_mask: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn SetProcessInformation(p: *mut core::ffi::c_void, class: i32, info: *const core::ffi::c_void, size: u32) -> i32;
+        }
+        // ProcessPowerThrottling = 4; EXECUTION_SPEED in the control mask, clear in the
+        // state mask = never throttle
+        let t = Throttle { version: 1, control_mask: 1, state_mask: 0 };
+        unsafe { SetProcessInformation(GetCurrentProcess(), 4, &t as *const Throttle as *const core::ffi::c_void, std::mem::size_of::<Throttle>() as u32) };
+    }
+}
+
 static MEM_LIMIT: AtomicU64 = AtomicU64::new(0);
 
 /// Sets the memory budget (the -m option).

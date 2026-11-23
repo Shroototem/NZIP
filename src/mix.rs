@@ -33,7 +33,7 @@ fn push(out: &mut Vec<Piece>, len: usize, kind: u8) {
 }
 
 /// Text test for one piece: mostly letters, almost no control bytes.
-fn is_text(b: &[u8]) -> bool {
+pub fn is_text(b: &[u8]) -> bool {
     if b.len() < 64 {
         return false;
     }

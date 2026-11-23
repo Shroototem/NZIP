@@ -133,6 +133,9 @@ struct Gpu {
     k: Kernels,
     name: String,
     disabled: bool,
+    /// device buffers kept between jobs (capacity, pointer): cuMemAlloc / cuMemFree cost
+    /// milliseconds each and every free synchronizes the device
+    cache: std::cell::RefCell<Vec<(usize, DevPtr)>>,
 }
 
 // The raw handles are only used while holding the global mutex.
@@ -145,6 +148,10 @@ static GPU_PCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 pub fn set_share(pct: u64) {
     GPU_PCT.store(pct.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn lock(m: &'static Mutex<Gpu>) -> std::sync::MutexGuard<'static, Gpu> {
+    m.lock().unwrap()
 }
 
 fn gpu() -> Option<&'static Mutex<Gpu>> {
@@ -228,7 +235,7 @@ unsafe fn init() -> Result<Gpu, String> {
             mf_pack: f("mf_pack")?,
             lz_parse: f("lz_parse")?,
         };
-        Ok(Gpu { api, ctx, k, name, disabled: false })
+        Ok(Gpu { api, ctx, k, name, disabled: false, cache: std::cell::RefCell::new(Vec::new()) })
     }
 }
 
@@ -255,13 +262,18 @@ struct SaDev<'a> {
 struct Buf<'a> {
     g: &'a Gpu,
     p: DevPtr,
+    cap: usize,
 }
 
 impl Drop for Buf<'_> {
     fn drop(&mut self) {
-        unsafe { (self.g.api.cuMemFree_v2)(self.p) };
+        // back to the cache for the next job
+        self.g.cache.borrow_mut().push((self.cap, self.p));
     }
 }
+
+/// Largest total the buffer cache keeps (more is freed).
+const CACHE_MAX: usize = 6 << 30;
 
 #[inline(always)]
 fn arg<T>(v: &mut T) -> *mut c_void {
@@ -270,9 +282,41 @@ fn arg<T>(v: &mut T) -> *mut c_void {
 
 impl Gpu {
     fn alloc(&self, bytes: usize) -> Result<Buf<'_>, String> {
+        let bytes = bytes.max(4);
+        {
+            // smallest cached buffer that fits, unless it is far too big
+            let mut c = self.cache.borrow_mut();
+            let best = c.iter().enumerate().filter(|(_, b)| b.0 >= bytes && b.0 <= bytes * 2 + (16 << 20)).min_by_key(|(_, b)| b.0).map(|(i, _)| i);
+            if let Some(i) = best {
+                let (cap, p) = c.swap_remove(i);
+                return Ok(Buf { g: self, p, cap });
+            }
+        }
+        // round sizes up so later jobs of similar size reuse the buffer
+        let cap = if bytes > 1 << 20 { bytes.next_multiple_of(bytes.next_power_of_two() / 8) } else { bytes };
         let mut p = 0;
-        ck(unsafe { (self.api.cuMemAlloc_v2)(&mut p, bytes.max(4)) }, "cuMemAlloc")?;
-        Ok(Buf { g: self, p })
+        if unsafe { (self.api.cuMemAlloc_v2)(&mut p, cap) } != 0 {
+            // out of memory: drop the cache and try once more
+            self.trim(0);
+            ck(unsafe { (self.api.cuMemAlloc_v2)(&mut p, cap) }, "cuMemAlloc")?;
+        }
+        Ok(Buf { g: self, p, cap })
+    }
+
+    /// Frees cached buffers until at most `keep` bytes stay cached.
+    fn trim(&self, keep: usize) {
+        let mut c = self.cache.borrow_mut();
+        c.sort_by_key(|&(cap, _)| std::cmp::Reverse(cap));
+        let mut total: usize = c.iter().map(|&(cap, _)| cap).sum();
+        while total > keep {
+            let Some((cap, p)) = c.pop() else { break };
+            unsafe { (self.api.cuMemFree_v2)(p) };
+            total -= cap;
+        }
+    }
+
+    fn cached(&self) -> u64 {
+        self.cache.borrow().iter().map(|&(cap, _)| cap as u64).sum()
     }
 
     /// Launch `f` over `n` threads in blocks of `block`.
@@ -296,7 +340,8 @@ impl Gpu {
     fn free_mem(&self) -> u64 {
         let (mut free, mut total) = (0usize, 0usize);
         unsafe { (self.api.cuMemGetInfo_v2)(&mut free, &mut total) };
-        free as u64 / 100 * GPU_PCT.load(std::sync::atomic::Ordering::Relaxed)
+        // cached buffers are ours to reuse
+        (free as u64 + self.cached()) / 100 * GPU_PCT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn read_u32(&self, p: DevPtr) -> Result<u32, String> {
@@ -503,7 +548,9 @@ impl Gpu {
         if e != 0 {
             return Err(format!("GPU suffix array failed verification ({e})"));
         }
-        let chunk = (n * 8 / (W * 4)).clamp(1, 4 << 20);
+        // one pass over all positions when the output fits (each pass costs syncs)
+        let chunk = n.clamp(1, 16 << 20);
+        let outb = self.alloc(chunk * W * 4)?;
         let skipd = self.alloc(skip.len())?;
         let flags: Vec<u8> = skip.iter().map(|&b| b as u8).collect();
         let counts = self.alloc(chunk * 4)?;
@@ -515,7 +562,7 @@ impl Gpu {
         let mut p0 = 0usize;
         while p0 < n {
             let cnt = chunk.min(n - p0);
-            let (mut p0_, mut cnt_, mut outp) = (p0 as u32, cnt as u32, d.ka.p);
+            let (mut p0_, mut cnt_, mut outp) = (p0 as u32, cnt as u32, outb.p);
             self.launch(
                 self.k.mf_find,
                 cnt as u32,
@@ -659,13 +706,26 @@ const GPU_MIN: usize = 4 << 20;
 /// BWT of `s`: on the GPU if possible, else on the CPU. Same result either way.
 pub fn bwt(s: &[u8]) -> (Vec<u8>, Vec<u32>) {
     if s.len() >= GPU_MIN && s.len() < (u32::MAX as usize >> 1) {
+        // the whole GPU turn (queueing, the job) runs without a CPU token, taken back
+        // only after the GPU is released, so neither cores nor the GPU wait on the other
+        if let Some(r) = crate::par::idle(|| gpu_bwt(s)) {
+            return r;
+        }
+    }
+    crate::sais::bwt(s)
+}
+
+fn gpu_bwt(s: &[u8]) -> Option<(Vec<u8>, Vec<u32>)> {
+    {
         if let Some(m) = gpu() {
-            let mut g = m.lock().unwrap();
+            let mut g = lock(m);
             if !g.disabled {
                 unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
                 if g.free_mem() >= vram_need(s.len()) {
-                    match g.bwt(s) {
-                        Ok(r) => return r,
+                    let r = g.bwt(s);
+                    g.trim(CACHE_MAX);
+                    match r {
+                        Ok(r) => return Some(r),
                         Err(e) => {
                             // never trust the device again in this run; the CPU redoes the block
                             eprintln!("nzip: GPU disabled for this run ({e}); using the CPU");
@@ -676,7 +736,7 @@ pub fn bwt(s: &[u8]) -> (Vec<u8>, Vec<u32>) {
             }
         }
     }
-    crate::sais::bwt(s)
+    None
 }
 
 /// LZ match lists for every position of `s` from the GPU (a suffix array and its
@@ -686,8 +746,20 @@ pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
     if s.len() < GPU_MIN || s.len() >= (u32::MAX as usize >> 1) {
         return None;
     }
+    // the GPU job runs without a CPU token (taken back once the GPU is released)
+    crate::par::idle(|| gpu_match_lists(s, seg_bits, skip))
+}
+
+fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, Vec<(u32, u32)>)> {
     let m = gpu()?;
-    let mut g = m.lock().unwrap();
+    // a busy GPU is not waited for: the CPU match finder takes this piece, so the GPU and
+    // every core stay busy (which pieces the GPU gets then depends on timing; any choice
+    // decodes the same)
+    let mut g = match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) if std::env::var_os("NZ_GPUWAIT").is_none() => return None,
+        Err(_) => lock(m),
+    };
     if g.disabled {
         return None;
     }
@@ -696,7 +768,9 @@ pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
         return None;
     }
     let t0 = std::time::Instant::now();
-    match g.match_lists(s, seg_bits, skip) {
+    let r = g.match_lists(s, seg_bits, skip);
+    g.trim(CACHE_MAX);
+    match r {
         Ok(r) => {
             if std::env::var_os("NZIP_TRACE").is_some() {
                 eprintln!("  gpu match lists: {} MB in {:.3}s", s.len() >> 20, t0.elapsed().as_secs_f64());
@@ -734,7 +808,7 @@ pub struct LzPrices {
 #[allow(clippy::too_many_arguments)]
 pub fn lz_parse(s: &[u8], ib: usize, idx: &[u32], pairs: &[(u32, u32)], dense: &[bool], seg0: usize, nseg: usize, prices: &[LzPrices], lit: &[u16]) -> Option<Vec<Option<Vec<(u32, u32)>>>> {
     let m = gpu()?;
-    let mut g = m.lock().unwrap();
+    let mut g = lock(m);
     if g.disabled {
         return None;
     }
@@ -767,7 +841,7 @@ pub fn unbwt(b: &[u8], rows: &[u32], seg: usize) -> Option<Vec<u8>> {
         return None;
     }
     let m = gpu()?;
-    let mut g = m.lock().unwrap();
+    let mut g = lock(m);
     if g.disabled {
         return None;
     }

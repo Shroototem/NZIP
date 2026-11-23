@@ -133,3 +133,101 @@ pub fn with_memory<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
     r
 }
 
+
+/// Ordered pipeline: `next` yields jobs (None = no more); up to `workers` jobs run at
+/// once, each on a worker thread holding a CPU token; `done` gets the results in job
+/// order. A finished job waits for earlier ones only while fewer than `ahead` results are
+/// parked, so one slow job never idles the other workers the way a batch barrier does.
+/// The calling thread only reads and writes, so it lends its token to the workers.
+pub fn pipeline<J: Send, R: Send>(
+    workers: usize,
+    ahead: usize,
+    mut next: impl FnMut() -> std::io::Result<Option<J>>,
+    work: impl Fn(J) -> R + Sync,
+    mut done: impl FnMut(R) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+    let workers = workers.max(1);
+    let (job_tx, job_rx) = mpsc::channel::<(usize, J)>();
+    let (res_tx, res_rx) = mpsc::channel::<(usize, R)>();
+    let job_rx = Mutex::new(job_rx);
+    give();
+    let r = std::thread::scope(|s| {
+        for _ in 0..workers {
+            let res_tx = res_tx.clone();
+            let (job_rx, work) = (&job_rx, &work);
+            s.spawn(move || {
+                loop {
+                    let job = job_rx.lock().unwrap().recv();
+                    let Ok((i, j)) = job else { break };
+                    let mut spins = 0u32;
+                    while !take() {
+                        spins += 1;
+                        if spins < 64 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        }
+                    }
+                    let r = work(j);
+                    give();
+                    if res_tx.send((i, r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(res_tx);
+        let mut sent = 0usize;
+        let mut out = 0usize;
+        let mut parked: BTreeMap<usize, R> = BTreeMap::new();
+        let mut eof = false;
+        let res = (|| -> std::io::Result<()> {
+            loop {
+                while !eof && sent - out - parked.len() < workers && parked.len() < ahead {
+                    match next()? {
+                        Some(j) => {
+                            job_tx.send((sent, j)).map_err(|_| std::io::Error::other("worker gone"))?;
+                            sent += 1;
+                        }
+                        None => eof = true,
+                    }
+                }
+                if out == sent {
+                    return Ok(());
+                }
+                let (i, r) = res_rx.recv().map_err(|_| std::io::Error::other("worker gone"))?;
+                parked.insert(i, r);
+                while let Some(r) = parked.remove(&out) {
+                    out += 1;
+                    done(r)?;
+                }
+            }
+        })();
+        drop(job_tx);
+        res
+    });
+    // take the caller's token back
+    while !take() {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    r
+}
+
+/// Runs `f` (a wait: a lock, a GPU job) without this thread's CPU token, so another
+/// thread can compute meanwhile; takes a token again before returning.
+pub fn idle<R>(f: impl FnOnce() -> R) -> R {
+    give();
+    let r = f();
+    let mut spins = 0u32;
+    while !take() {
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+    r
+}

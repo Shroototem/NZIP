@@ -19,7 +19,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -28,6 +28,7 @@ const KIND_BWT: u8 = 4;
 const KIND_LZ: u8 = 5;
 const KIND_LZX: u8 = 6;
 const KIND_MIX: u8 = 7;
+const KIND_REZIP: u8 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -117,9 +118,10 @@ pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
                 }
                 _ => {
                     // both engines run every core inside one block (coder segments, LZ
-                    // pieces), so a block is never cut below 32 MB just to feed threads:
-                    // small blocks cost 10-25% on mid-size files
-                    let per = total.div_ceil(threads).max(32 << 20);
+                    // pieces), so blocks are as big as the CPU sorter allows: small blocks
+                    // cost 2-25% (executables lose cross-section matches, text loses
+                    // context), and even a 128 MB CPU sort beats 7-Zip's time
+                    let per = total.div_ceil(threads).max(CPU_BLOCK as u64);
                     let by_ram = (ram / 7).max(8 << 20);
                     even(per.min(by_ram).min(CPU_BLOCK as u64))
                 }
@@ -129,7 +131,7 @@ pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
 }
 
 /// Largest block when the CPU sorts (one sort per thread).
-pub const CPU_BLOCK: usize = 64 << 20;
+pub const CPU_BLOCK: usize = 128 << 20;
 
 /// Blocks that can be in flight within the memory budget (at least 1).
 pub fn fit_threads(want: usize, per_block: u64) -> usize {
@@ -164,6 +166,14 @@ fn pack_block(data: &[u8], mode: Mode, threads: usize) -> Packed {
     if data.is_empty() {
         return stored(data, crc, "");
     }
+    // zip / gzip content first: deflated data looks random to the test below
+    if mode == Mode::Max {
+        if let Some((kind, out, note)) = pack_rezip(data, threads) {
+            if out.len() < data.len() {
+                return Packed { kind, raw_len: data.len(), crc, data: out, note };
+            }
+        }
+    }
     // Already-compressed data (JPEG, MP4, zip, ...) looks random: store it at memcpy speed.
     let sample = &data[..data.len().min(1 << 20)];
     if entropy_milli(sample) > 7990 && entropy_milli(data) > 7990 {
@@ -197,13 +207,13 @@ fn bwt_payload(src: &[u8], flags: u8, threads: usize) -> Vec<u8> {
 
 /// LZ payload: flags (1 = x86 split) then either one LZ stream, or the four split streams
 /// (chunk count, per-chunk part lengths, raw lengths, compressed lengths, data).
-fn lz_payload(data: &[u8], x86: bool, threads: usize) -> Vec<u8> {
+fn lz_payload(data: &[u8], x86: bool, threads: usize, arr: usize) -> Vec<u8> {
     let mut out = Vec::new();
     if x86 {
         let (sp, lens) = crate::x86::split_chunks(data, threads);
         let streams = [&sp.main, &sp.flags, &sp.addr, &sp.jump];
         // all four streams at once: the small ones are single sub-blocks
-        let coded: Vec<Vec<u8>> = par::map(&streams, 4, |s| crate::lzx::encode(s, threads, false, true));
+        let coded: Vec<Vec<u8>> = par::map(&streams, 4, |s| crate::lzx::encode(s, threads, false, true, arr));
         out.push(1);
         write_varint(&mut out, lens.len() as u64);
         for l in &lens {
@@ -222,7 +232,7 @@ fn lz_payload(data: &[u8], x86: bool, threads: usize) -> Vec<u8> {
         }
     } else {
         out.push(0);
-        out.extend_from_slice(&crate::lzx::encode(data, threads, false, false));
+        out.extend_from_slice(&crate::lzx::encode(data, threads, false, false, arr));
     }
     out
 }
@@ -242,27 +252,124 @@ fn sample_of(data: &[u8]) -> Vec<u8> {
 /// Max mode: text -> word transform + BWT. Anything else -> the BWT engine or the LZ engine,
 /// whichever codes a sample of the block (or the whole block, if small) smaller.
 fn pack_max(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
-    use crate::mix::{BIN, Piece, RAW, TEXT};
+    use crate::mix::{BIN, Piece};
     let zip = crate::mix::zip_pieces(data);
     if zip.is_none() && crate::textx::looks_like_text(data) {
-        return pack_plain(data, threads);
+        return pack_plain(data, threads, 0);
     }
-    let base = zip.unwrap_or_else(|| vec![Piece { len: data.len(), kind: BIN }]);
+    pack_pieces(data, zip.unwrap_or_else(|| vec![Piece { len: data.len(), kind: BIN }]), threads, 0)
+}
+
+/// Packs a block cut into text / binary pieces: raw chunks are split off, then either one
+/// engine codes it all or a mixed block keeps the kinds apart.
+fn pack_pieces(data: &[u8], base: Vec<crate::mix::Piece>, threads: usize, arr: usize) -> (u8, Vec<u8>, &'static str) {
+    use crate::mix::{BIN, RAW, TEXT};
     let pieces = crate::mix::raw_split(data, &base, threads);
     let has = |k: u8| pieces.iter().any(|p| p.kind == k);
     if !has(RAW) && !has(TEXT) {
-        return pack_plain(data, threads);
+        return pack_plain(data, threads, arr);
     }
     if !has(BIN) && !has(TEXT) {
         return (KIND_STORED, data.to_vec(), "incompressible");
     }
-    (KIND_MIX, mix_payload(data, &pieces, threads), if has(TEXT) { "zip split" } else { "raw split" })
+    (KIND_MIX, mix_payload(data, &pieces, threads, arr), if has(TEXT) { "zip split" } else { "raw split" })
+}
+
+/// The pieces of `p` that fall in `s..e`, cut at both ends.
+fn slice_pieces(p: &[crate::mix::Piece], s: usize, e: usize) -> Vec<crate::mix::Piece> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for q in p {
+        let (a, b) = (at.max(s), (at + q.len).min(e));
+        if a < b {
+            out.push(crate::mix::Piece { len: b - a, kind: q.kind });
+        }
+        at += q.len;
+        if at >= e {
+            break;
+        }
+    }
+    out
+}
+
+/// Deflate recompression (see rezip.rs): the table of rebuilt streams, then the inflated
+/// block in chunks no bigger than the block (each packed like a block of its own, all at
+/// once).
+fn pack_rezip(data: &[u8], threads: usize) -> Option<(u8, Vec<u8>, &'static str)> {
+    let x = crate::rezip::expand(data, threads, data.len() * REZIP_GROWTH + (16 << 20))?;
+    trace("deflate streams inflated", x.data.len());
+    let chunk = data.len().max(16 << 20);
+    let tab = crate::rezip::write_recs(&x.recs);
+    let mut out = Vec::with_capacity(data.len() / 2);
+    write_varint(&mut out, tab.len() as u64);
+    out.extend_from_slice(&tab);
+    let n = x.data.len().div_ceil(chunk);
+    write_varint(&mut out, n as u64);
+    let spans: Vec<(usize, usize)> = (0..n).map(|c| (c * chunk, ((c + 1) * chunk).min(x.data.len()))).collect();
+    let packed = par::map(&spans, n, |&(s, e)| {
+        let part = &x.data[s..e];
+        let (kind, payload, _) = pack_pieces(part, slice_pieces(&x.pieces, s, e), threads, REZIP_EFFORT);
+        if payload.len() >= part.len() { (KIND_STORED, part.to_vec()) } else { (kind, payload) }
+    });
+    for (&(s, e), (kind, payload)) in spans.iter().zip(packed) {
+        out.push(kind);
+        write_varint(&mut out, (e - s) as u64);
+        write_varint(&mut out, payload.len() as u64);
+        out.extend_from_slice(&payload);
+    }
+    Some((KIND_REZIP, out, "deflate rebuilt"))
+}
+
+/// Largest inflated size, as a multiple of the block (bounds decoder memory).
+const REZIP_GROWTH: usize = 3;
+
+/// LZ effort for inflated deflate data: 7-Zip passes over deflated data quickly (it is
+/// incompressible to LZMA), while nzip codes about twice the bytes once they are inflated.
+const REZIP_EFFORT: usize = 1;
+
+fn unpack_rezip(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
+    let e = || "corrupt deflate block".to_string();
+    let mut r = p;
+    let tl = read_varint(&mut r).map_err(|_| e())? as usize;
+    let recs = crate::rezip::read_recs(&mut r.get(..tl).ok_or_else(e)?, raw_len)?;
+    r = &r[tl..];
+    let n = read_varint(&mut r).map_err(|_| e())? as usize;
+    let cap = raw_len * REZIP_GROWTH + (16 << 20);
+    if n > cap / (16 << 20) + 2 {
+        return Err(e());
+    }
+    let mut parts = Vec::with_capacity(n);
+    let mut total = 0usize;
+    for _ in 0..n {
+        let kind = read_u8(&mut r).map_err(|_| e())?;
+        let len = read_varint(&mut r).map_err(|_| e())? as usize;
+        let c = read_varint(&mut r).map_err(|_| e())? as usize;
+        total += len;
+        if kind == KIND_REZIP || total > cap {
+            return Err(e());
+        }
+        parts.push((kind, len, r.get(..c).ok_or_else(e)?));
+        r = &r[c..];
+    }
+    let out = par::map(&parts, n, |&(kind, len, c)| unpack_payload(kind, c, len, threads));
+    let mut data = Vec::with_capacity(total);
+    for (p, &(_, len, _)) in out.into_iter().zip(&parts) {
+        let p = p?;
+        if p.len() != len {
+            return Err(e());
+        }
+        data.extend_from_slice(&p);
+    }
+    trace("inflated data decoded", data.len());
+    let out = crate::rezip::restore(&data, &recs, raw_len, threads);
+    trace("deflate rebuilt", raw_len);
+    out
 }
 
 /// Mixed block: text, binary and raw pieces packed apart (see mix.rs).
-fn mix_payload(data: &[u8], pieces: &[crate::mix::Piece], threads: usize) -> Vec<u8> {
+fn mix_payload(data: &[u8], pieces: &[crate::mix::Piece], threads: usize, arr: usize) -> Vec<u8> {
     let parts = crate::mix::gather(data, pieces);
-    let packed = par::map(&parts, 2, |p| if p.is_empty() { (KIND_STORED, Vec::new(), "") } else { pack_plain(p, threads) });
+    let packed = par::map(&parts, 2, |p| if p.is_empty() { (KIND_STORED, Vec::new(), "") } else { pack_plain(p, threads, arr) });
     let tab = crate::mix::write_table(pieces);
     let mut out = Vec::with_capacity(tab.len() + packed.iter().map(|p| p.1.len() + 16).sum::<usize>());
     write_varint(&mut out, tab.len() as u64);
@@ -300,7 +407,8 @@ fn unpack_mix(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
 }
 
 /// One engine for the whole block.
-fn pack_plain(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
+/// `arr`: cap on the LZ parser's effort (0 = the machine's).
+fn pack_plain(data: &[u8], threads: usize, arr: usize) -> (u8, Vec<u8>, &'static str) {
     if crate::textx::looks_like_text(data) {
         if let Some(t) = crate::textx::encode(data, threads) {
             if t.len() * 100 < data.len() * 95 {
@@ -321,15 +429,15 @@ fn pack_plain(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
     };
     if data.len() <= 2 << 20 {
         let b = bwt_full(data);
-        let l = lz_payload(data, x86, threads);
+        let l = lz_payload(data, x86, threads, arr);
         return if l.len() < b.len() { (KIND_LZX, l, if x86 { "x86+lz" } else { "lz" }) } else { (KIND_BWT, b, if x86 { "x86+bwt" } else { "bwt" }) };
     }
     let s = sample_of(data);
     let sb = bwt_full(&s).len();
-    let sl = lz_payload(&s, x86, threads).len();
+    let sl = lz_payload(&s, x86, threads, arr).len();
     trace(if sl <= sb { "engine: lz" } else { "engine: bwt" }, data.len());
     if sl <= sb {
-        (KIND_LZX, lz_payload(data, x86, threads), if x86 { "x86+lz" } else { "lz" })
+        (KIND_LZX, lz_payload(data, x86, threads, arr), if x86 { "x86+lz" } else { "lz" })
     } else {
         (KIND_BWT, bwt_full(data), if x86 { "x86+bwt" } else { "bwt" })
     }
@@ -403,7 +511,6 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     let threads = o.threads.max(1);
     // blocks in flight: limited by free RAM; spare threads work inside each block
     let workers = fit_threads(threads, block_mem(o.mode, bs));
-    let wave_len = if o.mode == Mode::Fast { workers * 4 } else { workers };
     let mut hdr = Vec::new();
     hdr.extend_from_slice(MAGIC);
     hdr.push(VERSION);
@@ -418,10 +525,20 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     let mut pos = 0u64;
     let mut ci = 0usize;
 
-    loop {
-        let mut wave: Vec<Vec<u8>> = Vec::new();
-        let mut eof = false;
-        while wave.len() < wave_len {
+    // LZ sub-blocks are sized from the work in flight per thread (fixed for the run, so
+    // the output does not depend on timing)
+    crate::lzx::set_share(((workers * bs) as u64).min(total.max(1)).div_ceil(threads as u64) as usize);
+    crate::lzx::set_effort(threads);
+    let mut eof = false;
+    let mut nblock = 0usize;
+    let verbose = o.verbose;
+    par::pipeline(
+        workers,
+        workers,
+        || {
+            if eof {
+                return Ok(None);
+            }
             let mut want = bs as u64;
             while ci < cuts.len() && cuts[ci] < pos + min_fill {
                 ci += 1;
@@ -434,30 +551,24 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
             let n = read_full(&mut input, &mut b)?;
             b.truncate(n);
             pos += n as u64;
-            if n > 0 {
-                wave.push(b);
-            }
             if n < want {
                 eof = true;
-                break;
             }
-        }
-        // Every block may use all threads inside: while blocks overlap the OS shares the
-        // cores, and the last block running gets the whole machine.
-        if let Some(d) = std::env::var_os("NZ_DUMPBLOCKS") {
-            for (i, b) in wave.iter().enumerate() {
-                std::fs::write(std::path::Path::new(&d).join(format!("b{}", st.blocks + i + 1)), b)?;
+            if n == 0 {
+                return Ok(None);
             }
-        }
-        let wave_bytes: usize = wave.iter().map(|b| b.len()).sum();
-        crate::lzx::set_share(wave_bytes.div_ceil(threads));
-        let packed = par::map(&wave, workers, |b| {
-            let p = pack_block(b, o.mode, threads);
+            nblock += 1;
+            if let Some(d) = std::env::var_os("NZ_DUMPBLOCKS") {
+                std::fs::write(std::path::Path::new(&d).join(format!("b{nblock}")), &b)?;
+            }
+            Ok(Some(b))
+        },
+        |b: Vec<u8>| {
+            let p = pack_block(&b, o.mode, threads);
             crate::progress::block(b.len() as u64);
             p
-        });
-        drop(wave);
-        for p in packed {
+        },
+        |p: Packed| {
             let mut h = Vec::with_capacity(24);
             h.push(p.kind);
             write_varint(&mut h, p.raw_len as u64);
@@ -469,14 +580,12 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
             st.out_bytes += (h.len() + p.data.len()) as u64;
             st.blocks += 1;
             st.largest = st.largest.max(p.raw_len as u64);
-            if o.verbose {
+            if verbose {
                 eprintln!("  block {:>4}: {:>11} -> {:>11} {}", st.blocks, p.raw_len, p.data.len(), p.note);
             }
-        }
-        if eof {
-            break;
-        }
-    }
+            Ok(())
+        },
+    )?;
     out.write_all(&[KIND_END])?;
     st.out_bytes += 1;
     out.flush()?;
@@ -552,6 +661,7 @@ fn unpack_payload(kind: u8, data: &[u8], raw_len: usize, threads: usize) -> Resu
         KIND_LZ => crate::lz::decompress(data, raw_len),
         KIND_LZX => unpack_lz(data, raw_len, threads),
         KIND_MIX => unpack_mix(data, raw_len, threads),
+        KIND_REZIP => unpack_rezip(data, raw_len, threads),
         _ => Err("unknown block kind".into()),
     }
 }
@@ -569,16 +679,19 @@ pub fn decompress<R: Read, W: Write>(mut input: R, h: &Header, mut out: W, threa
     let bs = h.block_size as usize;
     let threads = threads.max(1);
     let workers = fit_threads(threads, block_mem(h.mode, bs));
-    let wave_len = if h.mode == Mode::Fast { workers * 4 } else { workers };
     let mut written = 0u64;
     let mut done = false;
-    while !done {
-        let mut wave = Vec::new();
-        while wave.len() < wave_len {
+    par::pipeline(
+        workers,
+        workers * 2,
+        || {
+            if done {
+                return Ok(None);
+            }
             let kind = read_u8(&mut input)?;
             if kind == KIND_END {
                 done = true;
-                break;
+                return Ok(None);
             }
             let raw_len = read_varint(&mut input)? as usize;
             let comp_len = read_varint(&mut input)? as usize;
@@ -590,22 +703,22 @@ pub fn decompress<R: Read, W: Write>(mut input: R, h: &Header, mut out: W, threa
             let crc = u32::from_le_bytes(c);
             let mut data = vec![0u8; comp_len];
             input.read_exact(&mut data)?;
-            wave.push(Raw { kind, raw_len, crc, data });
-        }
-        let unpacked = par::map(&wave, workers, |b| {
+            Ok(Some(Raw { kind, raw_len, crc, data }))
+        },
+        |b: Raw| {
             trace("block decode start", b.raw_len);
-            let r = unpack_block(b, threads);
+            let r = unpack_block(&b, threads);
             trace("block decoded", b.raw_len);
             crate::progress::block(b.raw_len as u64);
             r
-        });
-        trace("wave decoded", 0);
-        for r in unpacked {
+        },
+        |r: io::Result<Vec<u8>>| {
             let d = r?;
             out.write_all(&d)?;
             written += d.len() as u64;
-        }
-    }
+            Ok(())
+        },
+    )?;
     out.flush()?;
     Ok(written)
 }

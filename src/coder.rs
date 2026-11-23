@@ -79,7 +79,7 @@ impl<'a> Decoder<'a> {
 
     #[inline(always)]
     fn byte(&mut self) -> u32 {
-        let b = self.src.get(self.pos).copied().unwrap_or(0);
+        let b = if self.pos < self.src.len() { self.src[self.pos] } else { 0 };
         self.pos += 1;
         b as u32
     }

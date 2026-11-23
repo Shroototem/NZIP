@@ -14,11 +14,13 @@ mod outfile;
 mod mixer;
 mod par;
 mod progress;
+mod rezip;
 mod sais;
 mod sys;
 mod tables;
 mod textx;
 mod x86;
+mod zlib;
 
 use container::{FLAG_DIR, Mode, Options};
 use std::fs::File;
@@ -80,7 +82,7 @@ fn parse() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     // a bare first word selects a developer command (lzsize, bwtsize, ...)
     let dev = match it.peek() {
-        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit" | "mixsize" | "lzstats") => it.next(),
+        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit" | "mixsize" | "lzstats" | "rezip") => it.next(),
         _ => None,
     };
     let mut a = Args {
@@ -307,11 +309,45 @@ fn run(a: Args) -> io::Result<()> {
                 (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64()
             );
         }
+        "rezip" => {
+            // dev: deflate streams our zlib port rebuilds, and the round trip
+            let data = std::fs::read(need_input()?)?;
+            let t0 = Instant::now();
+            match rezip::expand(&data, a.threads, usize::MAX) {
+                None => println!("nothing to expand"),
+                Some(x) => {
+                    let t1 = Instant::now();
+                    let comp: usize = x.recs.iter().map(|r| r.comp).sum();
+                    let text: usize = x.pieces.iter().filter(|p| p.kind == mix::TEXT).map(|p| p.len).sum();
+                    let mut r = rezip::restore(&x.data, &x.recs, data.len(), a.threads).unwrap();
+                    let mut t2 = Instant::now();
+                    if std::env::var_os("NZ_RZT").is_some() {
+                        for _ in 0..3 {
+                            let t = Instant::now();
+                            r = rezip::restore(&x.data, &x.recs, data.len(), a.threads).unwrap();
+                            eprintln!("  restore again {:.2}s", t.elapsed().as_secs_f64());
+                        }
+                        t2 = t1 + (Instant::now() - t1) / 4;
+                    }
+                    println!(
+                        "{} -> {} bytes: {} streams, {} deflated -> {} raw ({} text) | expand {:.2}s restore {:.2}s {}",
+                        data.len(), x.data.len(), x.recs.len(), comp, x.data.len() - (data.len() - comp), text,
+                        (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), if r == data { "OK" } else { "MISMATCH" }
+                    );
+                    if let Some(p) = std::env::var_os("NZ_DUMP") {
+                        std::fs::write(p, &x.data)?;
+                    }
+                    let mut big: Vec<usize> = x.recs.iter().map(|r| r.raw).collect();
+                    big.sort_unstable_by(|a, b| b.cmp(a));
+                    println!("largest raw streams: {:?}", &big[..big.len().min(8)]);
+                }
+            }
+        }
         "lzstats" => {
             // dev: cost breakdown of the LZ engine on one file (main stream if x86)
             let data = std::fs::read(need_input()?)?;
             let s = if x86::looks_like_x86(&data) && std::env::var_os("NOX86").is_none() { x86::split_chunks(&data, a.threads).0.main } else { data };
-            let c = lzx::encode(&s, a.threads, false, true);
+            let c = lzx::encode(&s, a.threads, false, true, 0);
             println!("{} -> {}", s.len(), c.len());
             lzx::stats(&c, s.len(), false);
         }
@@ -343,7 +379,7 @@ fn run(a: Args) -> io::Result<()> {
                 x86::encode(&mut data);
             }
             let t0 = Instant::now();
-            let c = lzx::encode(&data, a.threads, x86, x86);
+            let c = lzx::encode(&data, a.threads, x86, x86, 0);
             let t1 = Instant::now();
             let mut d = lzx::decode(&c, data.len(), a.threads, x86).unwrap();
             let t2 = Instant::now();
@@ -369,10 +405,10 @@ fn run(a: Args) -> io::Result<()> {
                     std::fs::write(d.join(n), v)?;
                 }
             }
-            let cm = lzx::encode(&sp.main, a.threads, false, true);
-            let cf = lzx::encode(&sp.flags, a.threads, false, true);
-            let ca = lzx::encode(&sp.addr, a.threads, false, true);
-            let cj = lzx::encode(&sp.jump, a.threads, false, true);
+            let cm = lzx::encode(&sp.main, a.threads, false, true, 0);
+            let cf = lzx::encode(&sp.flags, a.threads, false, true, 0);
+            let ca = lzx::encode(&sp.addr, a.threads, false, true, 0);
+            let cj = lzx::encode(&sp.jump, a.threads, false, true, 0);
             let t1 = Instant::now();
             if std::env::var_os("NZ_ENCONLY").is_some() {
                 println!("{} -> {} (main {}) | c {:.2}s", data.len(), cm.len() + cf.len() + ca.len() + cj.len(), cm.len(), (t1 - t0).as_secs_f64());
@@ -417,6 +453,7 @@ fn main() {
         unsafe { prctl(0x5961_6d61, u64::MAX, 0, 0, 0) };
     }
     outfile::install_handler();
+    sys::no_throttle();
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {

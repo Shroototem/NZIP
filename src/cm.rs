@@ -8,6 +8,9 @@
 use crate::tables::{squash, stretch};
 
 
+/// First step of a young counter: 1/2^YOUNG_START.
+pub const YOUNG_START: u32 = 2;
+
 #[derive(Clone, Copy)]
 pub struct Ctr {
     p: u16,
@@ -25,6 +28,19 @@ impl Ctr {
     #[inline(always)]
     pub fn p(self) -> u32 {
         self.p as u32
+    }
+
+    /// Like `update`, but a young counter learns fast: the low 3 bits count the bits seen,
+    /// and the step is 1/2^(count + START) until it reaches 1/2^rate. Models that restart
+    /// often (every LZ sub-block) lose much less to the cold start.
+    #[inline(always)]
+    pub fn update_young(&mut self, y: u32, rate: u32) {
+        let n = (self.p & 7) as u32;
+        let r = (n + YOUNG_START).min(rate);
+        let t = ((y << 16) - y) as i32;
+        let p = (self.p & !7) as i32;
+        let q = (p + ((t - p) >> r)) as u16;
+        self.p = (q & !7) | (n + 1).min(7) as u16;
     }
 
     /// Moves P(1) toward the coded bit by 1/2^rate.
