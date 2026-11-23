@@ -47,6 +47,7 @@ api! {
     cuMemFree_v2: fn(DevPtr);
     cuMemcpyHtoD_v2: fn(DevPtr, *const c_void, usize);
     cuMemcpyDtoH_v2: fn(*mut c_void, DevPtr, usize);
+    cuMemcpyDtoD_v2: fn(DevPtr, DevPtr, usize);
     cuMemsetD8_v2: fn(DevPtr, u8, usize);
     cuMemGetInfo_v2: fn(*mut usize, *mut usize);
     cuLaunchKernel: fn(*mut c_void, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, *mut c_void, *mut *mut c_void, *mut *mut c_void);
@@ -117,6 +118,12 @@ struct Kernels {
     ub_count: *mut c_void,
     ub_scatter: *mut c_void,
     ub_c1: *mut c_void,
+    mf_lcp: *mut c_void,
+    mf_find: *mut c_void,
+    mf_keys: *mut c_void,
+    mf_prev: *mut c_void,
+    mf_count: *mut c_void,
+    mf_pack: *mut c_void,
 }
 
 struct Gpu {
@@ -132,9 +139,16 @@ unsafe impl Send for Gpu {}
 
 static GPU: OnceLock<Option<Mutex<Gpu>>> = OnceLock::new();
 
+/// Share of free GPU memory nzip may use (the --gpu option; 0 = never use the GPU).
+static GPU_PCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(99);
+
+pub fn set_share(pct: u64) {
+    GPU_PCT.store(pct.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
 fn gpu() -> Option<&'static Mutex<Gpu>> {
     GPU.get_or_init(|| {
-        if std::env::var_os("NZIP_NO_GPU").is_some() {
+        if std::env::var_os("NZIP_NO_GPU").is_some() || GPU_PCT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return None;
         }
         match unsafe { init() } {
@@ -205,6 +219,12 @@ unsafe fn init() -> Result<Gpu, String> {
             ub_count: f("ub_count")?,
             ub_scatter: f("ub_scatter")?,
             ub_c1: f("ub_c1")?,
+            mf_lcp: f("mf_lcp")?,
+            mf_find: f("mf_find")?,
+            mf_keys: f("mf_keys")?,
+            mf_prev: f("mf_prev")?,
+            mf_count: f("mf_count")?,
+            mf_pack: f("mf_pack")?,
         };
         Ok(Gpu { api, ctx, k, name, disabled: false })
     }
@@ -214,6 +234,20 @@ unsafe fn init() -> Result<Gpu, String> {
 pub fn vram_need(n: usize) -> u64 {
     // text n, sa 4n, rank 4n, keys 2x8n, vals 2x4n, histogram n/4, + slack
     n as u64 * 34 + (64 << 20)
+}
+
+/// Device buffers left by `sa_build`.
+struct SaDev<'a> {
+    text: Buf<'a>,
+    sa: Buf<'a>,
+    rank: Buf<'a>,
+    ka: Buf<'a>,
+    kb: Buf<'a>,
+    va: Buf<'a>,
+    vb: Buf<'a>,
+    hist: Buf<'a>,
+    sums: Buf<'a>,
+    err: Buf<'a>,
 }
 
 struct Buf<'a> {
@@ -256,10 +290,11 @@ impl Gpu {
         )
     }
 
+    /// Free device memory nzip may use: the --gpu share of what is free now.
     fn free_mem(&self) -> u64 {
         let (mut free, mut total) = (0usize, 0usize);
         unsafe { (self.api.cuMemGetInfo_v2)(&mut free, &mut total) };
-        free as u64
+        free as u64 / 100 * GPU_PCT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn read_u32(&self, p: DevPtr) -> Result<u32, String> {
@@ -310,7 +345,9 @@ impl Gpu {
         Ok(flipped)
     }
 
-    fn bwt(&self, s: &[u8]) -> Result<(Vec<u8>, Vec<u32>), String> {
+    /// Suffix array of `s` on the device (verified by the caller via `err`): returns the
+    /// text, SA, inverse SA and scratch buffers (ka/kb are free after this, n*8 bytes each).
+    fn sa_build(&self, s: &[u8]) -> Result<SaDev<'_>, String> {
         let n = s.len();
         let n32 = n as u32;
         let tiles = n32.div_ceil(RS_TILE) as usize;
@@ -418,6 +455,103 @@ impl Gpu {
         let mut ep = err.p;
         self.launch(self.k.sa_isa, n32, 256, &mut [arg(&mut sap), arg(&mut np), arg(&mut rp), arg(&mut ep)])?;
         self.launch(self.k.sa_check, n32, 256, &mut [arg(&mut tp), arg(&mut sap), arg(&mut rp), arg(&mut np), arg(&mut ep)])?;
+        Ok(SaDev { text, sa, rank, ka, kb, va, vb, hist, sums, err })
+    }
+
+    /// LZ match lists for every position of `s` (see mf_find in sa.cu); positions in
+    /// segments where `skip(seg)` is set get empty lists.
+    fn match_lists(&self, s: &[u8], seg_bits: u32, skip: &[bool]) -> Result<(Vec<u32>, Vec<(u32, u32)>), String> {
+        const C: usize = 6;
+        const W: usize = 1 + 2 * C;
+        let n = s.len();
+        let n32 = n as u32;
+        let trace = std::env::var_os("NZIP_TRACE").is_some();
+        let mut tt = std::time::Instant::now();
+        let mut lap = |what: &str| {
+            if trace {
+                unsafe { (self.api.cuCtxSynchronize)() };
+                eprintln!("    mf {what}: {:.0} ms", tt.elapsed().as_secs_f64() * 1e3);
+                tt = std::time::Instant::now();
+            }
+        };
+        let d = self.sa_build(s)?;
+        lap("suffix array");
+        let (mut tp, mut np, mut sap, mut isap) = (d.text.p, n32, d.sa.p, d.rank.p);
+        // nearest earlier occurrence per gram length: stable sort (key = gram, value = position)
+        const LEVELS: usize = 6;
+        const GRAMS: [u32; LEVELS] = [3, 4, 6, 8, 12, 16];
+        let prev = self.alloc(n * 4 * LEVELS)?;
+        for (v, &l) in GRAMS.iter().enumerate() {
+            // key bytes: the gram itself up to 8 bytes, else a 32-bit hash
+            let shifts: Vec<u32> = (0..if l <= 8 { l } else { 4 }).map(|i| i * 8).collect();
+            let (mut kp, mut vp, mut l_) = (d.ka.p, d.va.p, l);
+            self.launch(self.k.mf_keys, n32, 256, &mut [arg(&mut tp), arg(&mut np), arg(&mut l_), arg(&mut kp), arg(&mut vp)])?;
+            let flipped = self.sort(d.ka.p, d.va.p, d.kb.p, d.vb.p, n32, &shifts, d.hist.p, d.sums.p)?;
+            let (mut ks, mut vs) = if flipped { (d.kb.p, d.vb.p) } else { (d.ka.p, d.va.p) };
+            let mut pp = prev.p + (v * n * 4) as u64;
+            self.launch(self.k.mf_prev, n32, 256, &mut [arg(&mut ks), arg(&mut vs), arg(&mut np), arg(&mut pp)])?;
+        }
+        lap("gram levels");
+        let mut prevp = prev.p;
+        let mut lcpp = d.kb.p;
+        self.launch(self.k.mf_lcp, n32, 256, &mut [arg(&mut tp), arg(&mut sap), arg(&mut np), arg(&mut lcpp)])?;
+        lap("lcp");
+        unsafe { ck((self.api.cuCtxSynchronize)(), "sync")? };
+        let e = self.read_u32(d.err.p)?;
+        if e != 0 {
+            return Err(format!("GPU suffix array failed verification ({e})"));
+        }
+        let chunk = (n * 8 / (W * 4)).clamp(1, 4 << 20);
+        let skipd = self.alloc(skip.len())?;
+        let flags: Vec<u8> = skip.iter().map(|&b| b as u8).collect();
+        let counts = self.alloc(chunk * 4)?;
+        let packed = self.alloc(chunk * C * 8)?;
+        unsafe { ck((self.api.cuMemcpyHtoD_v2)(skipd.p, flags.as_ptr() as *const c_void, flags.len()), "upload")? };
+        let mut idx = Vec::with_capacity(n + 1);
+        let mut m: Vec<(u32, u32)> = Vec::with_capacity(n * 2);
+        let mut offs = vec![0u32; chunk];
+        let mut p0 = 0usize;
+        while p0 < n {
+            let cnt = chunk.min(n - p0);
+            let (mut p0_, mut cnt_, mut outp) = (p0 as u32, cnt as u32, d.ka.p);
+            self.launch(
+                self.k.mf_find,
+                cnt as u32,
+                128,
+                &mut [arg(&mut tp), arg(&mut sap), arg(&mut isap), arg(&mut lcpp), arg(&mut prevp), arg(&mut np), arg(&mut p0_), arg(&mut cnt_), arg(&mut outp)],
+            )?;
+            let (mut sk, mut sb, mut cp) = (skipd.p, seg_bits, counts.p);
+            self.launch(self.k.mf_count, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut sk), arg(&mut sb), arg(&mut p0_), arg(&mut cnt_), arg(&mut cp)])?;
+            let last = self.read_u32(counts.p + (cnt as u64 - 1) * 4)?;
+            // exclusive scan in place: counts -> offsets (then counts are re-read for the pack)
+            let offsd = self.alloc(cnt * 4)?;
+            unsafe { ck((self.api.cuMemcpyDtoD_v2)(offsd.p, counts.p, cnt * 4), "copy")? };
+            self.scan(offsd.p, cnt as u32, d.sums.p, false, false)?;
+            let total = self.read_u32(offsd.p + (cnt as u64 - 1) * 4)? as usize + last as usize;
+            let (mut op, mut pk) = (offsd.p, packed.p);
+            self.launch(self.k.mf_pack, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut op), arg(&mut cp), arg(&mut cnt_), arg(&mut pk)])?;
+            lap("find");
+            let base = m.len() as u32;
+            m.resize(m.len() + total, (0, 0));
+            unsafe {
+                ck((self.api.cuMemcpyDtoH_v2)(offs.as_mut_ptr() as *mut c_void, offsd.p, cnt * 4), "download")?;
+                ck((self.api.cuMemcpyDtoH_v2)(m[base as usize..].as_mut_ptr() as *mut c_void, packed.p, total * 8), "download")?;
+            }
+            idx.extend(offs[..cnt].iter().map(|&o| base + o));
+            p0 += cnt;
+            lap("download");
+        }
+        idx.push(m.len() as u32);
+        Ok((idx, m))
+    }
+
+    fn bwt(&self, s: &[u8]) -> Result<(Vec<u8>, Vec<u32>), String> {
+        let n = s.len();
+        let n32 = n as u32;
+        let d = self.sa_build(s)?;
+        let (mut tp, mut np, mut sap) = (d.text.p, n32, d.sa.p);
+        let kx = d.ka.p;
+        let err = &d.err;
         // BWT + chain indices on the device: only n + 4k bytes come back
         let k = crate::sais::chains_for(n);
         let seg = n.div_ceil(k) as u32;
@@ -464,6 +598,38 @@ pub fn bwt(s: &[u8]) -> (Vec<u8>, Vec<u32>) {
         }
     }
     crate::sais::bwt(s)
+}
+
+/// LZ match lists for every position of `s` from the GPU (a suffix array and its
+/// nearest neighbours), or None when no GPU can take it. Index `p` covers
+/// `m[idx[p]..idx[p + 1]]`, pairs (len, dist - 1) with increasing length.
+pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, Vec<(u32, u32)>)> {
+    if s.len() < GPU_MIN || s.len() >= (u32::MAX as usize >> 1) {
+        return None;
+    }
+    let m = gpu()?;
+    let mut g = m.lock().unwrap();
+    if g.disabled {
+        return None;
+    }
+    unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
+    if g.free_mem() < vram_need(s.len()) + s.len() as u64 * 24 {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    match g.match_lists(s, seg_bits, skip) {
+        Ok(r) => {
+            if std::env::var_os("NZIP_TRACE").is_some() {
+                eprintln!("  gpu match lists: {} MB in {:.3}s", s.len() >> 20, t0.elapsed().as_secs_f64());
+            }
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("nzip: GPU disabled for this run ({e}); using the CPU");
+            g.disabled = true;
+            None
+        }
+    }
 }
 
 /// Smallest inverse BWT worth the GPU (driver start-up, transfers).
@@ -556,7 +722,7 @@ pub fn describe() -> String {
         Some(m) => {
             let g = m.lock().unwrap();
             unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
-            format!("{} ({:.1} GB free) - suffix sorting in max mode", g.name, g.free_mem() as f64 / 1e9)
+            format!("{} ({:.1} GB free) - suffix sorting and LZ match finding", g.name, g.free_mem() as f64 / 1e9)
         }
         None => "none usable (CPU suffix sorting; output is identical)".into(),
     }

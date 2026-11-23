@@ -16,10 +16,12 @@ nzip --info                                             show detected hardware
 |---|---|
 | *(default)* | **max**: best compression that stays fast |
 | `--fast` | **fast**: maximum speed (LZ77 on every core) |
+| `--gpu PCT` | share of free GPU memory to use (default 99; 0 = CPU only) |
+| `--ram PCT` | share of free RAM to use (default 99) |
 | `--cpu PCT` | share of logical CPUs to use (default 99) |
 | `-T N` | exact thread count (overrides `--cpu`) |
 | `-p` | progress bar |
-| `-m SIZE` | memory budget, e.g. `8G` (default: 90% of total RAM) |
+| `-m SIZE` | exact memory budget, e.g. `8G` (overrides `--ram`) |
 | `-b SIZE` | block size (default: automatic from cores, RAM and VRAM) |
 | `-f`, `-v` | overwrite output, verbose (per-block info, peak RAM) |
 
@@ -75,18 +77,27 @@ Compared with 7-Zip 26.06 LZMA2 Ultra (`-mx=9`, all threads; reference numbers a
 
 | Data | 7-Zip Ultra | nzip max | Size vs 7-Zip |
 |---|---:|---:|---:|
-| enwik8 (100 MB text) | 24,799,463 · 40.3 s · 0.80 s | 21,187,957 · 1.2 s · 0.70 s | **−14.6%** |
-| enwik9 (1 GB text) | 210,604,362 · 212.5 s · 3.1 s | 177,404,158 · 5.9 s · 4.0 s | **−15.8%** |
-| Silesia folder (212 MB) | 48,688,243 · 39.4 s · 1.51 s | 43,687,156 · 4.1 s · 1.14 s | **−10.3%** |
-| Portal 2 folder (238 MB, DLLs + NN weights) | 143,808,833 · 73.7 s · 4.5 s | 140,176,362 · 7.5 s · 3.0 s | **−2.5%** |
-| Firefox folder (381 MB, x64 DLLs + jars) | 93,338,587 · 78.3 s · 3.03 s | 96,636,809 · 19.0 s · 1.77 s | +3.5% |
-| TestSet folder (4.4 MB, mixed small files) | 3,344,553 · 0.32 s · 0.09 s | 3,343,699 · 0.21 s · 0.08 s | −0.03% |
+| enwik8 (100 MB text) | 24,799,463 · 40.3 s · 0.80 s | 21,187,957 · 1.2 s · 0.65 s | **−14.6%** |
+| enwik9 (1 GB text) | 210,604,362 · 212.5 s · 3.1 s | 177,404,158 · 5.9 s · 3.7 s | **−15.8%** |
+| Silesia folder (212 MB) | 48,688,243 · 39.4 s · 1.51 s | 43,283,139 · 7.8 s · 1.32 s | **−11.1%** |
+| Portal 2 folder (238 MB, DLLs + NN weights) | 143,808,833 · 73.7 s · 4.5 s | 140,192,073 · 11.8 s · 3.0 s | **−2.5%** |
+| Firefox folder (381 MB, x64 DLLs + jars) | 93,338,587 · 78.3 s · 3.03 s | 92,913,684 · 20.0 s · 2.6 s | **−0.45%** |
+| TestSet folder (4.4 MB, mixed small files) | 3,344,553 · 0.32 s · 0.09 s | 3,343,699 · 0.21 s · 0.08 s | −0.03% (not re-run) |
 
 Columns: size in bytes · compress time · decompress time.
 
-Open gaps: Firefox size (7-Zip compresses the whole folder as one stream, so small DLLs
-reuse xul.dll's code), enwik9 decode speed (4.0 s vs 3.1 s), and already-compressed
-content (PNG, gzip, fonts) that only recompression could shrink further.
+Zip/jar files (Firefox's omni.ja) are split by entry: text entries go to the BWT text
+engine, binary entries to the LZ engine; both omni.ja files now beat 7-Zip.
+
+The LZ parser keeps the 4 cheapest ways to reach each position (different state and
+rep distances), prices literals with the full model and tries match + literal + rep0
+steps: smaller output at no cost to decoding. Each LZ piece is parsed by several threads
+at once (match lists found ahead, segments parsed in parallel, one final coding pass), and
+when a GPU is present it finds the match lists for whole pieces from a suffix array plus
+nearest-occurrence tables, leaving the CPU to the parse.
+
+Open gaps: enwik9 decode speed (3.7 s vs 3.1 s) and already-compressed content (PNG,
+gzip, fonts) that only recompression could shrink.
 
 Inverse BWT runs on the GPU when one is present (CPU fallback; the result is checked).
 

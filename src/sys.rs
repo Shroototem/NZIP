@@ -18,11 +18,25 @@ pub fn total_ram() -> u64 {
     imp::total_ram().unwrap_or(4 << 30)
 }
 
-/// Bytes nzip may plan to use: the -m value, else 90% of total RAM. Block sizes and the
-/// number of blocks in flight are chosen to stay inside it, in both directions.
+static RAM_PCT: AtomicU64 = AtomicU64::new(99);
+
+/// Sets the share of free RAM nzip may plan to use (the --ram option).
+pub fn set_ram_share(pct: u64) {
+    RAM_PCT.store(pct.clamp(1, 100), Ordering::Relaxed);
+}
+
+/// RAM free for use right now (other programs' memory stays theirs).
+pub fn free_ram() -> u64 {
+    imp::free_ram().unwrap_or_else(total_ram).min(total_ram())
+}
+
+/// Bytes nzip may plan to use: the -m value, else the --ram share (default 99%) of the RAM
+/// free at start. Block sizes and the number of blocks in flight stay inside it, in both
+/// directions.
 pub fn mem_budget() -> u64 {
+    static FREE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     match MEM_LIMIT.load(Ordering::Relaxed) {
-        0 => total_ram() / 10 * 9,
+        0 => (*FREE.get_or_init(free_ram) / 100 * RAM_PCT.load(Ordering::Relaxed)).max(256 << 20),
         m => m,
     }
 }
@@ -41,6 +55,13 @@ mod imp {
             }
         }
         Some(total)
+    }
+
+    pub fn free_ram() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+        let kb: u64 = line[13..].trim().trim_end_matches("kB").trim().parse().ok()?;
+        Some(kb * 1024)
     }
 }
 
@@ -77,11 +98,30 @@ mod imp {
         let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
         if ok != 0 { Some(m.total_phys.min(m.total_virtual)) } else { None }
     }
+
+    pub fn free_ram() -> Option<u64> {
+        let mut m = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
+        if ok != 0 { Some(m.avail_phys.min(m.avail_virtual)) } else { None }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
 mod imp {
     pub fn total_ram() -> Option<u64> {
+        None
+    }
+    pub fn free_ram() -> Option<u64> {
         None
     }
 }

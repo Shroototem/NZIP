@@ -7,6 +7,8 @@
 //! BWT payload : flags:u8 (1 = word transform, 2 = x86 filter) bwt_len:varint idx[k]:u32le coder-stream
 //! LZ payload  : lz-stream (fast mode)
 //! LZX payload : flags:u8 (1 = x86 split) [4 raw lens, 4 comp lens] lzx stream(s) (max mode, binary)
+//! MIX payload : table_len:varint piece-table, then 2 parts (text, binary), each
+//!               kind:u8 raw_len:varint comp_len:varint payload
 //! ```
 //! Input is read in waves of blocks; each wave is compressed in parallel and written in
 //! order, so memory stays bounded for any input size. Blocks are independent: the decoder
@@ -25,6 +27,7 @@ const KIND_STORED: u8 = 1;
 const KIND_BWT: u8 = 4;
 const KIND_LZ: u8 = 5;
 const KIND_LZX: u8 = 6;
+const KIND_MIX: u8 = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -236,6 +239,54 @@ fn sample_of(data: &[u8]) -> Vec<u8> {
 /// Max mode: text -> word transform + BWT. Anything else -> the BWT engine or the LZ engine,
 /// whichever codes a sample of the block (or the whole block, if small) smaller.
 fn pack_max(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
+    if let Some(pieces) = crate::mix::zip_pieces(data) {
+        return (KIND_MIX, mix_payload(data, &pieces, threads), "zip split");
+    }
+    pack_plain(data, threads)
+}
+
+/// Mixed block: text pieces and binary pieces packed apart (see mix.rs).
+fn mix_payload(data: &[u8], pieces: &[crate::mix::Piece], threads: usize) -> Vec<u8> {
+    let (t, o) = crate::mix::gather(data, pieces);
+    let parts = [t, o];
+    let packed = par::map(&parts, 2, |p| if p.is_empty() { (KIND_STORED, Vec::new(), "") } else { pack_plain(p, threads) });
+    let tab = crate::mix::write_table(pieces);
+    let mut out = Vec::with_capacity(tab.len() + packed.iter().map(|p| p.1.len() + 16).sum::<usize>());
+    write_varint(&mut out, tab.len() as u64);
+    out.extend_from_slice(&tab);
+    for (raw, (kind, payload, _)) in parts.iter().zip(packed) {
+        let (kind, payload) = if payload.len() >= raw.len() { (KIND_STORED, raw.clone()) } else { (kind, payload) };
+        out.push(kind);
+        write_varint(&mut out, raw.len() as u64);
+        write_varint(&mut out, payload.len() as u64);
+        out.extend_from_slice(&payload);
+    }
+    out
+}
+
+fn unpack_mix(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
+    let e = || "corrupt mixed block".to_string();
+    let mut r = p;
+    let tl = read_varint(&mut r).map_err(|_| e())? as usize;
+    let pieces = crate::mix::read_table(r.get(..tl).ok_or_else(e)?, raw_len)?;
+    r = &r[tl..];
+    let mut parts = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let kind = read_u8(&mut r).map_err(|_| e())?;
+        let n = read_varint(&mut r).map_err(|_| e())? as usize;
+        let c = read_varint(&mut r).map_err(|_| e())? as usize;
+        if n > raw_len || kind == KIND_MIX {
+            return Err(e());
+        }
+        parts.push((kind, n, r.get(..c).ok_or_else(e)?));
+        r = &r[c..];
+    }
+    let out = par::map(&parts, 2, |&(kind, n, c)| unpack_payload(kind, c, n, threads)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    crate::mix::scatter(&out[0], &out[1], &pieces)
+}
+
+/// One engine for the whole block.
+fn pack_plain(data: &[u8], threads: usize) -> (u8, Vec<u8>, &'static str) {
     if crate::textx::looks_like_text(data) {
         if let Some(t) = crate::textx::encode(data, threads) {
             if t.len() * 100 < data.len() * 95 {
@@ -480,14 +531,19 @@ fn unpack_bwt(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
     }
 }
 
+fn unpack_payload(kind: u8, data: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
+    match kind {
+        KIND_STORED => Ok(data.to_vec()),
+        KIND_BWT => unpack_bwt(data, raw_len, threads),
+        KIND_LZ => crate::lz::decompress(data, raw_len),
+        KIND_LZX => unpack_lz(data, raw_len, threads),
+        KIND_MIX => unpack_mix(data, raw_len, threads),
+        _ => Err("unknown block kind".into()),
+    }
+}
+
 fn unpack_block(b: &Raw, threads: usize) -> io::Result<Vec<u8>> {
-    let out = match b.kind {
-        KIND_STORED => b.data.clone(),
-        KIND_BWT => unpack_bwt(&b.data, b.raw_len, threads).map_err(|e| bad(&e))?,
-        KIND_LZ => crate::lz::decompress(&b.data, b.raw_len).map_err(|e| bad(&e))?,
-        KIND_LZX => unpack_lz(&b.data, b.raw_len, threads).map_err(|e| bad(&e))?,
-        _ => return Err(bad("unknown block kind")),
-    };
+    let out = unpack_payload(b.kind, &b.data, b.raw_len, threads).map_err(|e| bad(&e))?;
     if out.len() != b.raw_len || crate::codec::crc32_par(&out, threads) != b.crc {
         return Err(bad("CRC mismatch: archive is corrupt"));
     }

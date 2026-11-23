@@ -6,9 +6,11 @@ mod cm;
 mod codec;
 mod coder;
 mod container;
+mod dedup;
 mod gpu;
 mod lz;
 mod lzx;
+mod mix;
 mod mixer;
 mod par;
 mod progress;
@@ -44,7 +46,10 @@ OPTIONS:
   -T N          exact number of threads (overrides --cpu)
   -p            show a progress bar
   -b SIZE       block size, e.g. 64M (default: automatic from cores, free RAM and VRAM)
-  -m SIZE       memory budget, e.g. 4G (default: 90% of total RAM); fewer blocks run at once
+  --gpu PCT     share of free GPU memory to use, 0-100 (default 99; 0 = CPU only)
+  --ram PCT     share of free RAM to use, 1-100 (default 99); fewer blocks run at once
+                when it is low
+  -m SIZE       exact memory budget, e.g. 4G (overrides --ram)
   -f            overwrite existing output
   -v            verbose
 ";
@@ -75,7 +80,7 @@ fn parse() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     // a bare first word selects a developer command (lzsize, bwtsize, ...)
     let dev = match it.peek() {
-        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit") => it.next(),
+        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit" | "dedupsize" | "mixsize" | "lzstats") => it.next(),
         _ => None,
     };
     let mut a = Args {
@@ -109,6 +114,14 @@ fn parse() -> Result<Args, String> {
             "--cpu" => {
                 let p: usize = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| (1..=100).contains(p)).ok_or("--cpu needs a percentage 1-100")?;
                 cpu_pct = p;
+            }
+            "--gpu" => {
+                let p: u64 = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| *p <= 100).ok_or("--gpu needs a percentage 0-100")?;
+                gpu::set_share(p);
+            }
+            "--ram" => {
+                let p: u64 = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| (1..=100).contains(p)).ok_or("--ram needs a percentage 1-100")?;
+                sys::set_ram_share(p);
             }
             "-p" | "--progress" => a.progress = true,
             "-T" => a.threads = it.next().and_then(|v| v.parse().ok()).filter(|&n| n > 0).ok_or("-T needs a number")?,
@@ -280,6 +293,48 @@ fn run(a: Args) -> io::Result<()> {
                 (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64()
             );
         }
+        "lzstats" => {
+            // dev: cost breakdown of the LZ engine on one file (main stream if x86)
+            let data = std::fs::read(need_input()?)?;
+            let s = if x86::looks_like_x86(&data) && std::env::var_os("NOX86").is_none() { x86::split_chunks(&data, a.threads).0.main } else { data };
+            let c = lzx::encode(&s, a.threads, false, true);
+            println!("{} -> {}", s.len(), c.len());
+            lzx::stats(&c, s.len(), false);
+        }
+        "mixsize" => {
+            // dev: zip-aware text / binary split; writes both streams next to NZ_DUMP
+            let data = std::fs::read(need_input()?)?;
+            let Some(p) = mix::zip_pieces(&data) else {
+                println!("no split");
+                return Ok(());
+            };
+            let (t, o) = mix::gather(&data, &p);
+            assert!(mix::scatter(&t, &o, &p).unwrap() == data);
+            let tab = mix::write_table(&p);
+            assert!(mix::read_table(&tab, data.len()).unwrap() == p);
+            if let Some(d) = std::env::var_os("NZ_DUMP") {
+                std::fs::write(PathBuf::from(&d).with_extension("text"), &t)?;
+                std::fs::write(PathBuf::from(&d).with_extension("bin"), &o)?;
+                std::fs::write(PathBuf::from(&d).with_extension("tab"), &tab)?;
+            }
+            println!("{} -> text {} bin {} pieces {} table {}", data.len(), t.len(), o.len(), p.len(), tab.len());
+        }
+        "dedupsize" => {
+            // dev: long-range dedup; writes literals and records next to NZ_DUMP
+            let data = std::fs::read(need_input()?)?;
+            let min = std::env::var("NZ_L").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+            let t0 = Instant::now();
+            let (l, r) = dedup::split(&data, min);
+            let t1 = Instant::now();
+            let j = dedup::join(&l, &r, data.len(), min).unwrap();
+            let t2 = Instant::now();
+            assert!(j == data, "dedup round trip failed");
+            if let Some(p) = std::env::var_os("NZ_DUMP") {
+                std::fs::write(PathBuf::from(&p).with_extension("lits"), &l)?;
+                std::fs::write(PathBuf::from(&p).with_extension("recs"), &r)?;
+            }
+            println!("{} -> lits {} recs {} | split {:.2}s join {:.2}s", data.len(), l.len(), r.len(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64());
+        }
         "lzsize" => {
             // dev: LZ engine on one file (x86 filter if detected), with timings
             let mut data = std::fs::read(need_input()?)?;
@@ -339,7 +394,7 @@ fn run(a: Args) -> io::Result<()> {
         }
         "info" => {
             println!("logical CPUs : {}", sys::cpus());
-            println!("RAM          : {:.1} GB total, budget {:.1} GB", sys::total_ram() as f64 / 1e9, sys::mem_budget() as f64 / 1e9);
+            println!("RAM          : {:.1} GB total, {:.1} GB free, budget {:.1} GB", sys::total_ram() as f64 / 1e9, sys::free_ram() as f64 / 1e9, sys::mem_budget() as f64 / 1e9);
             println!("AVX2 path    : {}", if codec::has_avx2() { "yes" } else { "no (portable path, same output)" });
             println!("GPU          : {}", gpu::describe());
             let bs = container::choose_block_size(1 << 40, Mode::Max, sys::cpus());
@@ -354,6 +409,14 @@ fn run(a: Args) -> io::Result<()> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("NZ_PTRACE").is_some() {
+        // dev: let a sampling profiler (gdb) attach to this process
+        unsafe extern "C" {
+            fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+        }
+        unsafe { prctl(0x5961_6d61, u64::MAX, 0, 0, 0) };
+    }
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {

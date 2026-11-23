@@ -377,3 +377,161 @@ extern "C" __global__ void ub_c1(const u32* __restrict__ offs, u32 tiles, u32 ro
     c1[c] = offs[c * tiles] + 1;
     if (c == 0) c1[256] = rows;
 }
+
+// ------------------------------------------------------------------ LZ match finding
+
+#define MF_MAXL 273
+#define MF_K 24
+#define MF_C 6
+
+// lcp[r] = common prefix length of suffixes sa[r-1] and sa[r] (capped), lcp[0] = 0.
+extern "C" __global__ void mf_lcp(const unsigned char* __restrict__ s, const u32* __restrict__ sa, u32 n,
+                                  unsigned short* lcp) {
+    u32 r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    if (r == 0) {
+        lcp[0] = 0;
+        return;
+    }
+    u32 a = sa[r - 1], b = sa[r];
+    u32 far = a > b ? a : b;
+    u32 lim = n - far;
+    if (lim > MF_MAXL) lim = MF_MAXL;
+    u32 l = 0;
+    while (l < lim && s[a + l] == s[b + l]) l++;
+    lcp[r] = (unsigned short)l;
+}
+
+#define MF_LEVELS 6
+__device__ __constant__ u32 MF_GRAM[MF_LEVELS] = {3, 4, 6, 8, 12, 16};
+
+// Key of the gram of length L at p (exact up to 8 bytes, hashed above); positions too close
+// to the end get a key of their own so they match nothing.
+extern "C" __global__ void mf_keys(const unsigned char* __restrict__ s, u32 n, u32 L, u64* key, u32* val) {
+    u32 p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    // grams running past the end are zero-padded: false pairs are dropped by the length check
+    u64 k;
+    if (L <= 8) {
+        k = 0;
+        for (u32 j = 0; j < L; j++) k = (k << 8) | (p + j < n ? s[p + j] : 0);
+    } else {
+        u32 h = 2166136261u;
+        for (u32 j = 0; j < L; j++) h = (h ^ (p + j < n ? s[p + j] : 0)) * 16777619u;
+        k = h;
+    }
+    key[p] = k;
+    val[p] = p;
+}
+
+// After a stable sort by key, each position's predecessor with the same key is its nearest
+// earlier occurrence of that gram.
+extern "C" __global__ void mf_prev(const u64* __restrict__ key, const u32* __restrict__ val, u32 n, u32* prev) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    prev[val[i]] = (i > 0 && key[i] == key[i - 1]) ? val[i - 1] : 0xFFFFFFFFu;
+}
+
+// For text positions [p0, p0 + cnt): earlier occurrences found among the MF_K nearest
+// suffix-array neighbours on each side. Output per position: count, then up to MF_C
+// (len, dist - 1) pairs with increasing length and increasing distance (each the nearest
+// occurrence for its length range).
+extern "C" __global__ void mf_find(const unsigned char* __restrict__ s, const u32* __restrict__ sa,
+                                   const u32* __restrict__ isa, const unsigned short* __restrict__ lcp,
+                                   const u32* __restrict__ prev, u32 n, u32 p0, u32 cnt, u32* out) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= cnt) return;
+    u32 p = p0 + t;
+    u32 r = isa[p];
+    u32 cl[2 * MF_K + MF_LEVELS], cd[2 * MF_K + MF_LEVELS];
+    u32 nc = 0;
+    // nearest earlier occurrence of each gram length
+    u32 room = n - p;
+    if (room > MF_MAXL) room = MF_MAXL;
+    for (u32 v = 0; v < MF_LEVELS; v++) {
+        u32 q = prev[(u64)v * n + p];
+        if (q == 0xFFFFFFFFu) continue;
+        u32 l = 0;
+        while (l < room && s[q + l] == s[p + l]) l++;
+        if (l >= 3) { cl[nc] = l; cd[nc] = p - q - 1; nc++; }
+    }
+    u32 m = MF_MAXL;
+    for (u32 i = 1; i <= MF_K && i <= r; i++) {
+        u32 l = lcp[r - i + 1];
+        if (l < m) m = l;
+        if (m < 3) break;
+        u32 q = sa[r - i];
+        if (q < p) { cl[nc] = m; cd[nc] = p - q - 1; nc++; }
+    }
+    m = MF_MAXL;
+    for (u32 i = 1; i <= MF_K && r + i < n; i++) {
+        u32 l = lcp[r + i];
+        if (l < m) m = l;
+        if (m < 3) break;
+        u32 q = sa[r + i];
+        if (q < p) { cl[nc] = m; cd[nc] = p - q - 1; nc++; }
+    }
+    // Pareto front: keep (len, dist) unless some candidate is at least as long and nearer.
+    // Selection by repeatedly taking the longest remaining (ties: nearest).
+    u32* o = out + (u64)t * (1 + 2 * MF_C);
+    u32 kl[2 * MF_K + MF_LEVELS], kd[2 * MF_K + MF_LEVELS];
+    u32 nk = 0;
+    u32 best_d = 0xffffffffu;
+    for (u32 it = 0; it < nc; it++) {
+        u32 bi = 0xffffffffu;
+        for (u32 j = 0; j < nc; j++) {
+            if (cl[j] == 0) continue;
+            if (bi == 0xffffffffu || cl[j] > cl[bi] || (cl[j] == cl[bi] && cd[j] < cd[bi])) bi = j;
+        }
+        if (bi == 0xffffffffu) break;
+        if (cd[bi] < best_d) {
+            best_d = cd[bi];
+            kl[nk] = cl[bi];
+            kd[nk] = cd[bi];
+            nk++;
+        }
+        cl[bi] = 0;
+    }
+    // kl is decreasing; emit increasing, keeping the nearest and the MF_C - 1 longest
+    u32 e = 0;
+    if (nk > MF_C) {
+        o[1 + 2 * e] = kl[nk - 1];
+        o[2 + 2 * e] = kd[nk - 1];
+        e++;
+        for (u32 j = MF_C - 2; j < MF_C - 1; j--) {
+            o[1 + 2 * e] = kl[j];
+            o[2 + 2 * e] = kd[j];
+            e++;
+            if (j == 0) break;
+        }
+    } else {
+        for (u32 j = nk; j > 0; j--) {
+            o[1 + 2 * e] = kl[j - 1];
+            o[2 + 2 * e] = kd[j - 1];
+            e++;
+        }
+    }
+    o[0] = e;
+}
+
+// Number of pairs each position keeps (0 inside skipped segments).
+extern "C" __global__ void mf_count(const u32* __restrict__ out, const unsigned char* __restrict__ skip,
+                                    u32 seg_bits, u32 p0, u32 cnt, u32* counts) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= cnt) return;
+    u32 c = out[(u64)t * (1 + 2 * MF_C)];
+    counts[t] = skip[(p0 + t) >> seg_bits] ? 0u : (c < MF_C ? c : MF_C);
+}
+
+// Packs the kept pairs contiguously (offs = exclusive scan of counts).
+extern "C" __global__ void mf_pack(const u32* __restrict__ out, const u32* __restrict__ offs,
+                                   const u32* __restrict__ counts, u32 cnt, u32* packed) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= cnt) return;
+    const u32* o = out + (u64)t * (1 + 2 * MF_C);
+    u32 k = counts[t], at = offs[t];
+    for (u32 j = 0; j < k; j++) {
+        packed[2 * (at + j)] = o[1 + 2 * j];
+        packed[2 * (at + j) + 1] = o[2 + 2 * j];
+    }
+}

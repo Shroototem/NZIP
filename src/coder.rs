@@ -138,6 +138,34 @@ pub trait BitIo {
     fn code(&mut self, bit: u32, p: u32) -> u32;
     /// Codes `k` (<= 16) equally likely bits of `v` (ignored when decoding).
     fn direct(&mut self, v: u32, k: u32) -> u32;
+    /// Dev statistics: the following bits belong to category `c` (no-op for real coders).
+    #[inline(always)]
+    fn cat(&mut self, _c: usize) {}
+}
+
+/// Dev: a decoder that adds up the cost of every bit per category.
+pub struct StatDec<'a> {
+    pub d: Decoder<'a>,
+    pub c: usize,
+    pub bits: [f64; 16],
+    pub n: [u64; 16],
+}
+
+impl BitIo for StatDec<'_> {
+    fn code(&mut self, _bit: u32, p: u32) -> u32 {
+        let b = self.d.decode(p);
+        let q = if b == 1 { p } else { 65536 - p };
+        self.bits[self.c] -= (q.max(1) as f64 / 65536.0).log2();
+        b
+    }
+    fn direct(&mut self, _v: u32, k: u32) -> u32 {
+        self.bits[self.c] += k as f64;
+        self.d.decode_direct(k)
+    }
+    fn cat(&mut self, c: usize) {
+        self.c = c;
+        self.n[c] += 1;
+    }
 }
 
 impl BitIo for Encoder {
