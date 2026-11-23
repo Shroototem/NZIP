@@ -217,18 +217,19 @@ fn run(a: Args) -> io::Result<()> {
             let mut r = BufReader::with_capacity(1 << 20, File::open(&input)?);
             let h = container::read_header(&mut r)?;
             let bar = progress::start(if test { "testing" } else { "decompressing" }, h.total, a.progress);
-            let n = if test {
-                container::decompress(r, &h, io::sink(), a.threads)?
+            // extra: bytes of duplicate files, copied rather than decoded
+            let (n, extra) = if test {
+                (container::decompress(r, &h, io::sink(), a.threads)?, 0)
             } else {
                 let out_path = a.output.clone().unwrap_or_else(|| outfile::unpack_name(&input));
                 if h.flags & FLAG_DIR != 0 {
                     let guard = outfile::OutDir::create(&out_path, a.force)?;
                     let mut u = archive::Unpacker::new(guard.temp_path());
                     let n = container::decompress(r, &h, &mut u, a.threads)?;
-                    u.finish()?;
+                    let extra = u.finish()?;
                     check_len(n, h.total)?;
                     guard.commit()?;
-                    n
+                    (n, extra)
                 } else {
                     let (guard, file) = outfile::OutFile::create(&out_path, a.force)?;
                     let mut out = BufWriter::with_capacity(1 << 20, file);
@@ -236,7 +237,7 @@ fn run(a: Args) -> io::Result<()> {
                     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
                     check_len(n, h.total)?;
                     guard.commit()?;
-                    n
+                    (n, 0)
                 }
             };
             drop(bar);
@@ -244,7 +245,8 @@ fn run(a: Args) -> io::Result<()> {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("size mismatch: {n} != {}", h.total)));
             }
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("{}: {} bytes OK in {:.2}s, {:.2} MB/s", input.display(), n, dt, mb(n) / dt);
+            let all = n + extra;
+            eprintln!("{}: {} bytes OK in {:.2}s, {:.2} MB/s", input.display(), all, dt, mb(all) / dt);
         }
         "bench" => {
             let input = need_input()?;

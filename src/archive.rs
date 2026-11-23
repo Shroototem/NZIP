@@ -250,11 +250,13 @@ pub struct Unpacker {
     /// Files in stream order: path, size, and the earlier file to copy for duplicates.
     files: std::collections::VecDeque<(PathBuf, u64, Option<PathBuf>)>,
     cur: Option<(File, u64)>,
+    /// Bytes written by copying duplicates (not in the stream).
+    copied: u64,
 }
 
 impl Unpacker {
     pub fn new(root: &Path) -> Unpacker {
-        Unpacker { root: root.to_path_buf(), head: Vec::new(), need: None, files: Default::default(), cur: None }
+        Unpacker { root: root.to_path_buf(), head: Vec::new(), need: None, files: Default::default(), cur: None, copied: 0 }
     }
 
     fn parse_manifest(&mut self) -> io::Result<()> {
@@ -301,7 +303,7 @@ impl Unpacker {
                     }
                     if let Some(src) = src {
                         // the original came earlier in the stream, so it is complete
-                        fs::copy(&src, &p)?;
+                        self.copied += fs::copy(&src, &p)?;
                         continue;
                     }
                     let f = File::create(&p)?;
@@ -315,7 +317,8 @@ impl Unpacker {
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    /// Ends unpacking; returns the bytes written by copying duplicate files.
+    pub fn finish(mut self) -> io::Result<u64> {
         if self.need.is_none() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "missing folder manifest"));
         }
@@ -323,7 +326,7 @@ impl Unpacker {
         if self.cur.is_some() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "archive ended before all files were written"));
         }
-        Ok(())
+        Ok(self.copied)
     }
 }
 
