@@ -1,18 +1,23 @@
-[workspace]
-resolver = "3"
-members = ["crates/bsc-sys", "crates/bwtc", "crates/ncore", "crates/nzip", "crates/nzip-cli", "crates/mixlab", "crates/unpack"]
-
-[workspace.package]
-version = "0.4.0"
+[package]
+name = "nzip"
+version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Universal lossless compressor: integer-only context mixing with an online neural mixer, deterministic on every CPU"
+
+[features]
+# dev only: lets NZ_K override model constants (archives then need the same values)
+tune = []
+
+[dependencies]
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-debug = 1
 panic = "abort"
+debug = false
+strip = true
 
 [profile.test]
-opt-level = 2
+opt-level = 3

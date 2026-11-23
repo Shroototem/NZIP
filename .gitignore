@@ -2,7 +2,7 @@
 /.sandbox/
 # Build output
 /target/
-# Packages built by scripts/build-dist.sh and scripts/build-windows.sh
+# Packages built by scripts/build-linux.sh and scripts/build-windows.sh
 /dist/
 # Benchmark and training data (large, downloaded)
 /data/
