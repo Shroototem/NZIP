@@ -90,7 +90,10 @@ pub struct Split {
     pub jump: Vec<u8>,
 }
 
-pub fn split(b: &[u8]) -> Split {
+/// `base`: offset of `b` in the block (targets are block-relative); `total`: block length.
+/// A branch is converted when its target lies inside the block: real calls and jumps do,
+/// while E8/E9 bytes inside data point at random places, almost always outside.
+pub fn split(b: &[u8], base: usize, total: usize) -> Split {
     let n = b.len();
     let mut main = Vec::with_capacity(n);
     let mut addr = Vec::with_capacity(n / 32);
@@ -112,11 +115,10 @@ pub fn split(b: &[u8]) -> Split {
         let c = b[j];
         main.push(c);
         if opcode_end(prev, c) {
-            let conv = j + 4 < n && (b[j + 4].wrapping_add(1) & 0xFE) == 0;
+            let abs = if j + 4 < n { u32::from_le_bytes([b[j + 1], b[j + 2], b[j + 3], b[j + 4]]).wrapping_add((base + j + 5) as u32) } else { u32::MAX };
+            let conv = (abs as usize) < total;
             push_flag(conv, &mut flags);
             if conv {
-                let rel = u32::from_le_bytes([b[j + 1], b[j + 2], b[j + 3], b[j + 4]]);
-                let abs = rel.wrapping_add((j + 5) as u32);
                 if c == 0xE8 { &mut addr } else { &mut jump }.extend_from_slice(&abs.to_be_bytes());
                 prev = b[j + 4];
                 j += 5;
@@ -132,8 +134,9 @@ pub fn split(b: &[u8]) -> Split {
     Split { main, flags, addr, jump }
 }
 
-/// Inverse of `split`; `n` = original length.
-pub fn join(main: &[u8], flags: &[u8], addr: &[u8], jump: &[u8], n: usize) -> Result<Vec<u8>, String> {
+/// Inverse of `split` into `out` (`out.len()` = original length).
+pub fn join_into(main: &[u8], flags: &[u8], addr: &[u8], jump: &[u8], base: usize, out_buf: &mut [u8]) -> Result<(), String> {
+    let n = out_buf.len();
     let e = || "corrupt x86 streams".to_string();
     let mut out = Vec::with_capacity(n);
     let (mut fi, mut ai, mut ji) = (0usize, 0usize, 0usize);
@@ -155,7 +158,7 @@ pub fn join(main: &[u8], flags: &[u8], addr: &[u8], jump: &[u8], n: usize) -> Re
                     jump.get(ji - 4..ji).ok_or_else(e)?
                 };
                 let abs = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
-                let rel = abs.wrapping_sub(out.len() as u32 + 4);
+                let rel = abs.wrapping_sub((base + out.len()) as u32 + 4);
                 out.extend_from_slice(&rel.to_le_bytes());
                 prev = out[out.len() - 1];
                 continue;
@@ -166,6 +169,57 @@ pub fn join(main: &[u8], flags: &[u8], addr: &[u8], jump: &[u8], n: usize) -> Re
     if out.len() != n || mi != main.len() {
         return Err(e());
     }
+    out_buf.copy_from_slice(&out);
+    Ok(())
+}
+
+/// Chunks are split independently, so both directions run on every core.
+const CHUNK: usize = 4 << 20;
+
+/// Split in independent 4 MiB chunks; streams are concatenated and `lens` gets, per
+/// chunk, the length of its part of (main, flags, addr, jump).
+pub fn split_chunks(b: &[u8], threads: usize) -> (Split, Vec<[usize; 4]>) {
+    let parts: Vec<(usize, &[u8])> = b.chunks(CHUNK).enumerate().map(|(i, c)| (i * CHUNK, c)).collect();
+    let sp = crate::par::map(&parts, threads, |&(base, c)| split(c, base, b.len()));
+    let lens = sp.iter().map(|s| [s.main.len(), s.flags.len(), s.addr.len(), s.jump.len()]).collect();
+    let mut all = Split { main: Vec::with_capacity(b.len()), flags: Vec::new(), addr: Vec::new(), jump: Vec::new() };
+    for s in sp {
+        all.main.extend_from_slice(&s.main);
+        all.flags.extend_from_slice(&s.flags);
+        all.addr.extend_from_slice(&s.addr);
+        all.jump.extend_from_slice(&s.jump);
+    }
+    (all, lens)
+}
+
+/// Inverse of `split_chunks`; `n` = original length.
+pub fn join_chunks(s: [&[u8]; 4], lens: &[[usize; 4]], n: usize, threads: usize) -> Result<Vec<u8>, String> {
+    let e = || "corrupt x86 streams".to_string();
+    if lens.len() != n.div_ceil(CHUNK) {
+        return Err(e());
+    }
+    let mut off = [0usize; 4];
+    let mut jobs = Vec::with_capacity(lens.len());
+    for l in lens {
+        let mut part = [&[][..]; 4];
+        for k in 0..4 {
+            part[k] = s[k].get(off[k]..off[k] + l[k]).ok_or_else(e)?;
+            off[k] += l[k];
+        }
+        jobs.push(part);
+    }
+    if (0..4).any(|k| off[k] != s[k].len()) {
+        return Err(e());
+    }
+    let mut out = vec![0u8; n];
+    let res = std::sync::Mutex::new(Ok(()));
+    crate::par::for_chunks(out.chunks_mut(CHUNK).collect(), threads, |i, o| {
+        let p = jobs[i];
+        if let Err(x) = join_into(p[0], p[1], p[2], p[3], i * CHUNK, o) {
+            *res.lock().unwrap() = Err(x);
+        }
+    });
+    res.into_inner().unwrap()?;
     Ok(out)
 }
 
@@ -186,11 +240,14 @@ mod tests {
         assert_ne!(v, orig);
         super::decode(&mut v);
         assert_eq!(v, orig);
-        let sp = super::split(&orig);
-        assert!(sp.main.len() < orig.len());
-        assert_eq!(super::join(&sp.main, &sp.flags, &sp.addr, &sp.jump, orig.len()).unwrap(), orig);
-        let tail = [0xE8u8, 1, 2];
-        let sp = super::split(&tail);
-        assert_eq!(super::join(&sp.main, &sp.flags, &sp.addr, &sp.jump, 3).unwrap(), tail);
+        let mut big = orig.clone();
+        for _ in 0..30 {
+            big.extend_from_slice(&orig);
+        }
+        for d in [&orig[..], &big[..], &[0xE8u8, 1, 2][..], &[][..]] {
+            let (sp, lens) = super::split_chunks(d, 4);
+            assert!(d.len() < 1000 || sp.main.len() < d.len());
+            assert_eq!(super::join_chunks([&sp.main, &sp.flags, &sp.addr, &sp.jump], &lens, d.len(), 3).unwrap(), d);
+        }
     }
 }

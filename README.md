@@ -5,17 +5,20 @@ an NVIDIA GPU when one is present, and stays inside a memory budget, so it also 
 low-RAM machines and on inputs of any size (files or folders, 100 GB+).
 
 ```
-nzip c [--fast] [options] <file|folder> [-o out.nz]   compress
-nzip d [options] <archive.nz> [-o out]                 decompress (file or folder)
-nzip t <archive.nz>                                    test integrity
-nzip info                                              show detected hardware
+nzip -c [--fast] [options] <file|folder> [-o out.nz]   compress
+nzip -d [options] <archive.nz> [-o out]                 decompress (file or folder)
+nzip -t <archive.nz>                                    test integrity
+nzip --bench <file>                                     compress + decompress in memory, verify
+nzip --info                                             show detected hardware
 ```
 
 | Option | Meaning |
 |---|---|
 | *(default)* | **max**: best compression that stays fast |
 | `--fast` | **fast**: maximum speed (LZ77 on every core) |
-| `-t N` | threads (default: all logical CPUs) |
+| `--cpu PCT` | share of logical CPUs to use (default 99) |
+| `-T N` | exact thread count (overrides `--cpu`) |
+| `-p` | progress bar |
 | `-m SIZE` | memory budget, e.g. `8G` (default: 90% of total RAM) |
 | `-b SIZE` | block size (default: automatic from cores, RAM and VRAM) |
 | `-f`, `-v` | overwrite output, verbose (per-block info, peak RAM) |
@@ -67,27 +70,27 @@ a 4.3 GB peak. A machine with less RAM runs fewer blocks at once and gets the sa
 
 ## Results (Ryzen 9 3900X, 24 threads, RTX 5060 Ti 16 GB; every run verified)
 
-Compared with 7-Zip 26.06 LZMA2 Ultra (`-mx=9`, all threads):
+Compared with 7-Zip 26.06 LZMA2 Ultra (`-mx=9`, all threads; reference numbers are kept in
+[bench/7z-ultra.md](bench/7z-ultra.md)). nzip uses its default 99% of CPU threads.
 
 | Data | 7-Zip Ultra | nzip max | Size vs 7-Zip |
 |---|---:|---:|---:|
-| enwik8 (100 MB text) | 24,799,463 · 56.4 s · 0.96 s | 21,002,521 · 2.2 s · 1.5 s | **−15.3%** |
-| enwik9 (1 GB text) | 210,604,362 · 212.5 s · 3.1 s | 175,916,660 · 9.4 s · 10.8 s | **−16.5%** |
-| Silesia folder (212 MB) | 48,688,243 · 139.5 s · 3.9 s | 46,250,824 · 3.0 s · 3.4 s | **−5.0%** |
-| Firefox folder (381 MB, mostly x64 DLLs) | 93,338,606 · 205 s · 4.0 s | 114,698,850 · 5.5 s · 6.4 s | +22.9% |
+| enwik8 (100 MB text) | 24,799,463 · 40.3 s · 0.80 s | 21,187,957 · 1.2 s · 0.70 s | **−14.6%** |
+| enwik9 (1 GB text) | 210,604,362 · 212.5 s · 3.1 s | 177,404,158 · 5.9 s · 4.0 s | **−15.8%** |
+| Silesia folder (212 MB) | 48,688,243 · 39.4 s · 1.51 s | 43,687,156 · 4.1 s · 1.14 s | **−10.3%** |
+| Portal 2 folder (238 MB, DLLs + NN weights) | 143,808,833 · 73.7 s · 4.5 s | 140,176,362 · 7.5 s · 3.0 s | **−2.5%** |
+| Firefox folder (381 MB, x64 DLLs + jars) | 93,338,587 · 78.3 s · 3.03 s | 96,636,809 · 19.0 s · 1.77 s | +3.5% |
+| TestSet folder (4.4 MB, mixed small files) | 3,344,553 · 0.32 s · 0.09 s | 3,343,699 · 0.21 s · 0.08 s | −0.03% |
 
 Columns: size in bytes · compress time · decompress time.
 
-nzip compresses 20–70x faster than 7-Zip Ultra. 7-Zip decompresses faster: LZMA decoding
-is cheap, while a BWT + context-mixing decoder costs about as much as its encoder
-(enwik9: 3.1 s vs 10.8 s). For reference, the enwik9 record (fx2-cmix, 100.4 MB) takes tens
-of hours on one core.
+Open gaps: Firefox size (7-Zip compresses the whole folder as one stream, so small DLLs
+reuse xul.dll's code), enwik9 decode speed (4.0 s vs 3.1 s), and already-compressed
+content (PNG, gzip, fonts) that only recompression could shrink further.
+
+Inverse BWT runs on the GPU when one is present (CPU fallback; the result is checked).
 
 Fast mode on enwik9: 474,584,207 bytes, 1.27 GB/s compress, 2.24 GB/s decompress.
-
-Known weak spot: executables and other binary code. BWT scrambles the fixed-position
-structure that LZ77 coders exploit. The next planned engine is an LZ77 parser with
-context-mixed coding for binary blocks.
 
 ## Building
 

@@ -9,44 +9,15 @@
 //! integer arithmetic coder. One generic function drives both encoder and decoder, so the
 //! two can never disagree.
 
+use crate::cm::{Ctr, G, Mix, NG, hg};
+
+/// Adaptation rate (shift) of the literal counters.
+const LR: u32 = 3;
 use crate::coder::{BitIo, Decoder, Dual, Encoder};
-use crate::mixer::{Mixer, knob};
-use crate::tables::{squash, stretch};
+use crate::mixer::knob;
+
 
 const O2_BITS: usize = 16;
-
-struct Apm {
-    t: Vec<u16>,
-    idx: usize,
-}
-
-impl Apm {
-    fn new(n: usize) -> Apm {
-        let mut t = vec![0u16; n * 33];
-        for i in 0..n {
-            for j in 0..33 {
-                t[i * 33 + j] = (squash((j as i32 - 16) * 128) * 16) as u16;
-            }
-        }
-        Apm { t, idx: 0 }
-    }
-    #[inline(always)]
-    fn pp(&mut self, pr: i32, cx: usize) -> i32 {
-        let s = stretch(pr) + 2048;
-        let lo = (s >> 7) as usize;
-        let w = s & 127;
-        let base = cx * 33 + lo;
-        self.idx = base + ((w >> 6) as usize);
-        ((self.t[base] as i32) * (128 - w) + (self.t[base + 1] as i32) * w) >> 7
-    }
-    #[inline(always)]
-    fn update(&mut self, y: u32) {
-        const R: u32 = 7;
-        let g = ((y << 16) + (y << R) - y - y) as i32;
-        let v = self.t[self.idx] as i32;
-        self.t[self.idx] = (v + ((g - v) >> R)) as u16;
-    }
-}
 
 #[inline(always)]
 fn to16(p12: i32) -> u32 {
@@ -69,31 +40,29 @@ struct Model {
     // decision 1: same as c1
     a_run: Vec<Dual>,
     a_hist: Vec<Dual>,
-    a_o2: Vec<Dual>,
-    a_hc: Vec<Dual>,
-    ma: Mixer,
-    apm_a: Apm,
+    a_o2: Vec<Ctr>,
+    a_hc: Vec<Ctr>,
+    ma: Mix<7>,
     // decision 2: same as d2
     b_cd: Vec<Dual>,
     b_hist: Vec<Dual>,
     b_run: Vec<Dual>,
-    mb: Mixer,
+    mb: Mix<7>,
     // literal bits
-    t0: Vec<Dual>,
-    t1: Vec<Dual>,
-    t2: Vec<Dual>,
-    t3: Vec<Dual>,
-    ml: Mixer,
-    apm_l: Apm,
+    t0: Vec<G>,
+    t1: Vec<G>,
+    t2: Vec<G>,
+    t3: Vec<G>,
+    ml: Mix<5>,
     lim: u32,
     lf: u32,
 }
 
 impl Model {
     fn new() -> Model {
-        let ma = Mixer::new(9, 24 * 4);
-        let mb = Mixer::new(7, 24);
-        let ml = Mixer::new(9, 256);
+        let ma = Mix::new(24 * 4, 2);
+        let mb = Mix::new(24, 2);
+        let ml = Mix::new(256, 2);
         Model {
             c1: 0,
             c2: 0,
@@ -104,20 +73,18 @@ impl Model {
             h2: 0,
             a_run: vec![Dual::INIT; 24 * 256],
             a_hist: vec![Dual::INIT; 1 << 12],
-            a_o2: vec![Dual::INIT; 1 << 16],
-            a_hc: vec![Dual::INIT; 1 << 16],
+            a_o2: vec![Ctr::INIT; 1 << 16],
+            a_hc: vec![Ctr::INIT; 1 << 16],
             ma,
-            apm_a: Apm::new(24 * 16),
             b_cd: vec![Dual::INIT; 65536],
             b_hist: vec![Dual::INIT; 256 * 24],
             b_run: vec![Dual::INIT; 24 * 256],
             mb,
-            t0: vec![Dual::INIT; 256],
-            t1: vec![Dual::INIT; 65536],
-            t2: vec![Dual::INIT; 1 << O2_BITS],
-            t3: vec![Dual::INIT; 65536],
+            t0: vec![G::INIT; NG],
+            t1: vec![G::INIT; 256 * NG],
+            t2: vec![G::INIT; 1 << (O2_BITS - 4)],
+            t3: vec![G::INIT; 256 * NG],
             ml,
-            apm_l: Apm::new(256),
             lim: knob(1) as u32,
             lf: knob(2) as u32,
         }
@@ -133,25 +100,19 @@ impl Model {
         // 1. same as previous byte?
         let ia = rq * 256 + c1;
         let ih = self.hist_a & 0xfff;
-        let io2 = (self.h2 >> 6) & 0xffff;
+        let io2 = self.h2;
         let ihc = ((self.hist_a & 0xff) << 8) | c1;
-        let m = &mut self.ma;
-        self.a_run[ia].add(m);
-        self.a_hist[ih].add(m);
-        self.a_o2[io2].add(m);
-        self.a_hc[ihc].add(m);
-        m.add(256);
-        m.select(rq * 4 + (self.hist_a & 3));
-        let pr = m.predict();
-        let pa = self.apm_a.pp(pr, rq * 16 + (self.hist_a & 15));
-        let p = (pr * 16 + pa) >> 1;
+        let (r0, r1) = self.a_run[ia].st2();
+        let (h0, h1) = self.a_hist[ih].st2();
+        self.ma.predict([r0, r1, h0, h1, self.a_o2[io2].st(), self.a_hc[ihc].st(), 256], rq * 4 + (self.hist_a & 3));
+        let pr = self.ma.pr12();
+        let p = pr * 16;
         let y = io.code((c == c1) as u32, (p.clamp(32, 65535 - 32)) as u32);
         self.a_run[ia].update(y, lf, lim);
         self.a_hist[ih].update(y, lf, lim);
-        self.a_o2[io2].update(y, lf, lim);
-        self.a_hc[ihc].update(y, lf, lim);
+        self.a_o2[io2].update(y, LR);
+        self.a_hc[ihc].update(y, LR);
         self.ma.update(y);
-        self.apm_a.update(y);
         self.hist_a = (self.hist_a << 1) | y as usize;
         if y == 1 {
             self.run += 1;
@@ -164,13 +125,11 @@ impl Model {
         let icd = (c1 << 8) | d2;
         let ihb = ((self.hist_b & 0xff) * 24) + rq;
         let irb = rq * 256 + d2;
-        let m = &mut self.mb;
-        self.b_cd[icd].add(m);
-        self.b_hist[ihb].add(m);
-        self.b_run[irb].add(m);
-        m.add(256);
-        m.select(rq);
-        let pr = m.predict();
+        let (d0, d1) = self.b_cd[icd].st2();
+        let (h0, h1) = self.b_hist[ihb].st2();
+        let (r0, r1) = self.b_run[irb].st2();
+        self.mb.predict([d0, d1, h0, h1, r0, r1, 256], rq);
+        let pr = self.mb.pr12();
         let y = io.code((c == d2) as u32, to16(pr));
         self.b_cd[icd].update(y, lf, lim);
         self.b_hist[ihb].update(y, lf, lim);
@@ -180,30 +139,28 @@ impl Model {
         let sym = if y == 1 {
             d2
         } else {
-            // 3. literal, MSB first
+            // 3. literal, MSB first, one counter group per nibble and context
             let mut c0 = 1usize;
-            for i in (0..8).rev() {
-                let i1 = (c1 << 8) | c0;
-                let i2 = self.h2 | c0;
-                let i3 = (d2 << 8) | c0;
-                let m = &mut self.ml;
-                self.t3[i3].add(m);
-                self.t0[c0].add(m);
-                self.t1[i1].add(m);
-                self.t2[i2].add(m);
-                m.add(256);
-                m.select(c0);
-                let pr = m.predict();
-                let pl = self.apm_l.pp(pr, c0);
-                let p = (pr * 16 + pl * 3) >> 2;
-                let bit = io.code(((c >> i) & 1) as u32, p.clamp(32, 65535 - 32) as u32);
-                self.t0[c0].update(bit, lf, lim);
-                self.t1[i1].update(bit, lf, lim);
-                self.t2[i2].update(bit, lf, lim);
-                self.t3[i3].update(bit, lf, lim);
-                self.ml.update(bit);
-                self.apm_l.update(bit);
-                c0 = (c0 << 1) | bit as usize;
+            let c2 = (self.h2 as u32) * NG as u32;
+            for half in 0..2 {
+                let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
+                let g0 = &mut self.t0[sel].0;
+                let g1 = &mut self.t1[c1 * NG + sel].0;
+                let g2 = &mut self.t2[hg(c2 + sel as u32, O2_BITS as u32 - 4)].0;
+                let g3 = &mut self.t3[d2 * NG + sel].0;
+                let mut j = 1usize;
+                for q in 0..4 {
+                    let i = 7 - (half * 4 + q);
+                    let p = self.ml.predict([g3[j].st(), g0[j].st(), g1[j].st(), g2[j].st(), 256], c0);
+                    let bit = io.code(((c >> i) & 1) as u32, p);
+                    g0[j].update(bit, LR);
+                    g1[j].update(bit, LR);
+                    g2[j].update(bit, LR);
+                    g3[j].update(bit, LR);
+                    self.ml.update(bit);
+                    j = (j << 1) | bit as usize;
+                    c0 = (c0 << 1) | bit as usize;
+                }
             }
             c0 & 255
         };
@@ -217,8 +174,7 @@ impl Model {
     fn push(&mut self, c: usize) {
         self.c2 = self.c1;
         self.c1 = c;
-        let h = ((self.c2 << 8) | self.c1) as u32;
-        self.h2 = ((h.wrapping_mul(0x9E37_79B1) >> (32 - (O2_BITS - 8))) as usize) << 8;
+        self.h2 = (self.c2 << 8) | self.c1;
     }
 }
 
@@ -274,18 +230,27 @@ fn decode_one(src: &[u8], n: usize) -> Result<Vec<u8>, String> {
     decode_impl(src, n)
 }
 
-/// Segments are coded independently so one block can use every core in both directions.
-/// The count depends only on the data length, never on the machine.
-pub fn segments_for(n: usize) -> usize {
-    (n / (2 << 20)).clamp(1, 256)
+/// Segments are coded independently so one block can use every core in both directions:
+/// about 2 MiB each, rounded to a whole number of rounds over `threads` so no round runs
+/// with idle cores (at least 256 KiB each, at most 1024 segments).
+fn segments_for(n: usize, threads: usize) -> usize {
+    let t = threads.max(1);
+    let rounds = n.div_ceil(t * (2 << 20)).max(1);
+    (rounds * t).min(n / (256 << 10)).clamp(1, MAX_SEGS)
 }
+
+const MAX_SEGS: usize = 1024;
 
 /// `segs:varint {comp_len:varint}* streams...`
 pub fn encode(data: &[u8], threads: usize) -> Vec<u8> {
-    let k = segments_for(data.len());
+    let k = segments_for(data.len(), threads);
     let seg = data.len().div_ceil(k).max(1);
     let parts: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(seg).collect() };
-    let coded = crate::par::map(&parts, threads, |p| encode_one(p));
+    let coded = crate::par::map(&parts, threads, |p| {
+        let c = encode_one(p);
+        crate::progress::work(p.len());
+        c
+    });
     let mut out = Vec::with_capacity(coded.iter().map(|c| c.len()).sum::<usize>() + 16 * k);
     crate::container::write_varint(&mut out, coded.len() as u64);
     for c in &coded {
@@ -301,7 +266,7 @@ pub fn decode(src: &[u8], n: usize, threads: usize) -> Result<Vec<u8>, String> {
     let e = || "corrupt BWT coder stream".to_string();
     let mut r = src;
     let k = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
-    if k != segments_for(n) && !(n == 0 && k == 1) {
+    if k == 0 || k > MAX_SEGS || k > n.max(1) {
         return Err(e());
     }
     let mut lens = Vec::with_capacity(k);
@@ -317,7 +282,11 @@ pub fn decode(src: &[u8], n: usize, threads: usize) -> Result<Vec<u8>, String> {
         let len = seg.min(n.saturating_sub(i * seg));
         jobs.push((s, len));
     }
-    let parts = crate::par::map(&jobs, threads, |&(s, len)| decode_one(s, len));
+    let parts = crate::par::map(&jobs, threads, |&(s, len)| {
+        let d = decode_one(s, len);
+        crate::progress::work(len);
+        d
+    });
     let mut out = Vec::with_capacity(n);
     for p in parts {
         out.extend_from_slice(&p?);

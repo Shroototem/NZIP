@@ -113,6 +113,10 @@ struct Kernels {
     sa_isa: *mut c_void,
     sa_check: *mut c_void,
     sa_bwt: *mut c_void,
+    ub_walk: *mut c_void,
+    ub_count: *mut c_void,
+    ub_scatter: *mut c_void,
+    ub_c1: *mut c_void,
 }
 
 struct Gpu {
@@ -197,6 +201,10 @@ unsafe fn init() -> Result<Gpu, String> {
             sa_isa: f("sa_isa")?,
             sa_check: f("sa_check")?,
             sa_bwt: f("sa_bwt")?,
+            ub_walk: f("ub_walk")?,
+            ub_count: f("ub_count")?,
+            ub_scatter: f("ub_scatter")?,
+            ub_c1: f("ub_c1")?,
         };
         Ok(Gpu { api, ctx, k, name, disabled: false })
     }
@@ -433,7 +441,7 @@ impl Gpu {
 }
 
 /// Smallest block worth sending to the GPU (below this the CPU is as fast).
-const GPU_MIN: usize = 1 << 20;
+const GPU_MIN: usize = 4 << 20;
 
 /// BWT of `s`: on the GPU if possible, else on the CPU. Same result either way.
 pub fn bwt(s: &[u8]) -> (Vec<u8>, Vec<u32>) {
@@ -456,6 +464,80 @@ pub fn bwt(s: &[u8]) -> (Vec<u8>, Vec<u32>) {
         }
     }
     crate::sais::bwt(s)
+}
+
+/// Smallest inverse BWT worth the GPU (driver start-up, transfers).
+const UNBWT_MIN: usize = 32 << 20;
+
+/// Inverse BWT on the GPU (`b` = BWT output, `rows` = start row of each chain of `seg`
+/// text bytes; rows[0] is the primary index), or None to let the CPU do it. The result is
+/// checked: every chain must end exactly where the next one starts.
+pub fn unbwt(b: &[u8], rows: &[u32], seg: usize) -> Option<Vec<u8>> {
+    let n = b.len();
+    if n < UNBWT_MIN || n >= u32::MAX as usize >> 1 {
+        return None;
+    }
+    let m = gpu()?;
+    let mut g = m.lock().unwrap();
+    if g.disabled {
+        return None;
+    }
+    unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
+    // text n, psi 4(n+1), output n, per-tile counts 4*256*(n/UB_T) = n/2, + slack
+    let need = n as u64 * 7 + (64 << 20);
+    if g.free_mem() < need {
+        return None;
+    }
+    match g.unbwt(b, rows, seg) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("nzip: GPU disabled for this run ({e}); using the CPU");
+            g.disabled = true;
+            None
+        }
+    }
+}
+
+const UB_T: usize = 2048;
+
+impl Gpu {
+    fn unbwt(&self, b: &[u8], rows: &[u32], seg: usize) -> Result<Vec<u8>, String> {
+        let n = b.len();
+        let nrows = n + 1;
+        let k = n.div_ceil(seg);
+        let tiles = nrows.div_ceil(UB_T);
+        let db = self.alloc(n)?;
+        let dpsi = self.alloc(nrows * 4)?;
+        let dcnt = self.alloc(tiles * 256 * 4)?;
+        let dsums = self.alloc(((tiles * 256).div_ceil(TILE as usize) + 16) * 4)?;
+        let dc1 = self.alloc(257 * 4)?;
+        let drows = self.alloc(k * 4)?;
+        let dout = self.alloc(n)?;
+        let dfin = self.alloc(k * 4)?;
+        unsafe {
+            ck((self.api.cuMemcpyHtoD_v2)(db.p, b.as_ptr() as *const c_void, n), "upload")?;
+            ck((self.api.cuMemcpyHtoD_v2)(drows.p, rows.as_ptr() as *const c_void, k * 4), "upload rows")?;
+        }
+        let (mut pb, mut nr, mut p1, mut nt) = (db.p, nrows as u32, rows[0], tiles as u32);
+        let (mut cnt, mut psi, mut c1) = (dcnt.p, dpsi.p, dc1.p);
+        self.launch(self.k.ub_count, tiles as u32, 64, &mut [arg(&mut pb), arg(&mut nr), arg(&mut p1), arg(&mut nt), arg(&mut cnt)])?;
+        self.scan(dcnt.p, (tiles * 256) as u32, dsums.p, false, false)?;
+        self.launch_grid(self.k.ub_c1, 1, 256, &mut [arg(&mut cnt), arg(&mut nt), arg(&mut nr), arg(&mut c1)])?;
+        self.launch(self.k.ub_scatter, tiles as u32, 64, &mut [arg(&mut pb), arg(&mut nr), arg(&mut p1), arg(&mut nt), arg(&mut cnt), arg(&mut psi)])?;
+        let (mut r, mut kk, mut sg, mut nn, mut o, mut f) = (drows.p, k as u32, seg as u32, n as u32, dout.p, dfin.p);
+        self.launch(self.k.ub_walk, k as u32, 64, &mut [arg(&mut psi), arg(&mut r), arg(&mut kk), arg(&mut sg), arg(&mut nn), arg(&mut c1), arg(&mut o), arg(&mut f)])?;
+        ck(unsafe { (self.api.cuCtxSynchronize)() }, "inverse BWT")?;
+        let mut out = vec![0u8; n];
+        let mut fin = vec![0u32; k];
+        unsafe {
+            ck((self.api.cuMemcpyDtoH_v2)(out.as_mut_ptr() as *mut c_void, dout.p, n), "download")?;
+            ck((self.api.cuMemcpyDtoH_v2)(fin.as_mut_ptr() as *mut c_void, dfin.p, k * 4), "download")?;
+        }
+        if (0..k.saturating_sub(1)).any(|t| fin[t] != rows[t + 1]) || fin[k - 1] != 0 {
+            return Err("inverse BWT check failed".into());
+        }
+        Ok(out)
+    }
 }
 
 /// Free device memory if a GPU is usable (for block sizing).

@@ -208,7 +208,9 @@ pub fn suffix_array(s: &[u8]) -> Vec<u32> {
 /// follows them in parallel (across threads, and 8 at a time within a thread to hide memory
 /// latency). Stored in the archive, so decoding never depends on the encoder's thread count.
 pub fn chains_for(n: usize) -> usize {
-    (n >> 20).clamp(8, 256)
+    // one chain per 16 KiB: inverse BWT walks 8 chains at a time per CPU thread (to overlap
+    // cache misses) and one per GPU thread, and both need many to keep every core busy
+    (n >> 14).clamp(8, 16384)
 }
 
 /// BWT with a virtual end-of-block sentinel. Returns the transform and the matrix rows of
@@ -258,6 +260,9 @@ pub fn unbwt(b: &[u8], idx: &[u32], threads: usize) -> Result<Vec<u8>, String> {
         return Err("bad BWT index".into());
     }
     // L' (n+1 rows): L'[0] = b[p1-1], L'[p1] = '$', L'[r] = b[r-1] otherwise.
+    if let Some(out) = crate::gpu::unbwt(b, &idx[..used], seg) {
+        return Ok(out);
+    }
     let lch = |r: usize| -> u8 { if r == 0 { b[p1 - 1] } else { b[r - 1] } };
     let threads = threads.clamp(1, 64).min((n >> 16).max(1));
     let rows = n + 1;

@@ -12,12 +12,12 @@
 //! order, so memory stays bounded for any input size. Blocks are independent: the decoder
 //! picks its own thread count from its free RAM and always gets identical bytes.
 
-use crate::codec::{crc32, entropy_milli};
+use crate::codec::entropy_milli;
 use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -105,8 +105,10 @@ pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
         Mode::Fast => 4 << 20,
         Mode::Max => {
             let ram = crate::sys::mem_budget();
-            match crate::gpu::free_vram() {
-                Some(v) if total >= 4 << 20 => {
+            // small inputs never wait for the GPU driver to start (~0.2 s)
+            let vram = if total >= 32 << 20 { crate::gpu::free_vram() } else { None };
+            match vram {
+                Some(v) => {
                     let by_vram = v.saturating_sub(256 << 20) / 34;
                     even(by_vram.min(ram / 7).min(MAX_BLOCK as u64))
                 }
@@ -152,7 +154,7 @@ fn trace(what: &str, len: usize) {
 
 fn pack_block(data: &[u8], mode: Mode, threads: usize) -> Packed {
     trace("block start", data.len());
-    let crc = crc32(data);
+    let crc = crate::codec::crc32_par(data, threads);
     if data.is_empty() {
         return stored(data, crc, "");
     }
@@ -188,14 +190,21 @@ fn bwt_payload(src: &[u8], flags: u8, threads: usize) -> Vec<u8> {
 }
 
 /// LZ payload: flags (1 = x86 split) then either one LZ stream, or the four split streams
-/// (raw lengths, compressed lengths, data).
+/// (chunk count, per-chunk part lengths, raw lengths, compressed lengths, data).
 fn lz_payload(data: &[u8], x86: bool, threads: usize) -> Vec<u8> {
     let mut out = Vec::new();
     if x86 {
-        let sp = crate::x86::split(data);
+        let (sp, lens) = crate::x86::split_chunks(data, threads);
         let streams = [&sp.main, &sp.flags, &sp.addr, &sp.jump];
-        let coded: Vec<Vec<u8>> = streams.iter().map(|s| crate::lzx::encode(s, threads, false)).collect();
+        // all four streams at once: the small ones are single sub-blocks
+        let coded: Vec<Vec<u8>> = par::map(&streams, 4, |s| crate::lzx::encode(s, threads, false, true));
         out.push(1);
+        write_varint(&mut out, lens.len() as u64);
+        for l in &lens {
+            for &v in l {
+                write_varint(&mut out, v as u64);
+            }
+        }
         for s in streams {
             write_varint(&mut out, s.len() as u64);
         }
@@ -207,7 +216,7 @@ fn lz_payload(data: &[u8], x86: bool, threads: usize) -> Vec<u8> {
         }
     } else {
         out.push(0);
-        out.extend_from_slice(&crate::lzx::encode(data, threads, false));
+        out.extend_from_slice(&crate::lzx::encode(data, threads, false, false));
     }
     out
 }
@@ -268,6 +277,16 @@ fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String
     if flags & 1 == 0 {
         return crate::lzx::decode(r, raw_len, threads, false);
     }
+    let nchunks = read_varint(&mut r).map_err(|_| e())? as usize;
+    if nchunks > raw_len / (1 << 20) + 2 {
+        return Err(e());
+    }
+    let mut lens = vec![[0usize; 4]; nchunks];
+    for l in lens.iter_mut() {
+        for v in l.iter_mut() {
+            *v = read_varint(&mut r).map_err(|_| e())? as usize;
+        }
+    }
     let mut raw = [0usize; 4];
     let mut comp = [0usize; 4];
     for v in raw.iter_mut().chain(comp.iter_mut()) {
@@ -276,14 +295,18 @@ fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String
     if raw.iter().any(|&l| l > raw_len.max(1 << 16) * 2) {
         return Err(e());
     }
-    let mut streams = Vec::with_capacity(4);
+    let mut jobs = Vec::with_capacity(4);
     let mut off = 0usize;
     for i in 0..4 {
-        let c = r.get(off..off + comp[i]).ok_or_else(e)?;
+        jobs.push((r.get(off..off + comp[i]).ok_or_else(e)?, raw[i]));
         off += comp[i];
-        streams.push(crate::lzx::decode(c, raw[i], threads, false)?);
     }
-    crate::x86::join(&streams[0], &streams[1], &streams[2], &streams[3], raw_len)
+    trace("lz streams start", raw_len);
+    let streams = par::map(&jobs, 4, |&(c, n)| crate::lzx::decode(c, n, threads, false)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    trace("lz streams done", raw_len);
+    let j = crate::x86::join_chunks([&streams[0], &streams[1], &streams[2], &streams[3]], &lens, raw_len, threads);
+    trace("x86 join done", raw_len);
+    j
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -305,6 +328,8 @@ pub struct Stats {
     pub blocks: usize,
     pub threads: usize,
     pub block_size: usize,
+    /// largest block actually written
+    pub largest: u64,
 }
 
 /// `cuts`: sorted stream offsets where a block boundary is preferred (file / type changes).
@@ -322,7 +347,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     write_varint(&mut hdr, total);
     write_varint(&mut hdr, bs as u64);
     out.write_all(&hdr)?;
-    let mut st = Stats { in_bytes: 0, out_bytes: hdr.len() as u64, blocks: 0, threads: workers, block_size: bs };
+    let mut st = Stats { in_bytes: 0, out_bytes: hdr.len() as u64, blocks: 0, threads: workers, block_size: bs, largest: 0 };
     // a preferred cut is taken once the block holds at least this much
     let min_fill = (bs as u64 / 4).min(4 << 20).max(1);
     let mut pos = 0u64;
@@ -354,7 +379,18 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
         }
         // Every block may use all threads inside: while blocks overlap the OS shares the
         // cores, and the last block running gets the whole machine.
-        let packed = par::map(&wave, workers, |b| pack_block(b, o.mode, threads));
+        if let Some(d) = std::env::var_os("NZ_DUMPBLOCKS") {
+            for (i, b) in wave.iter().enumerate() {
+                std::fs::write(std::path::Path::new(&d).join(format!("b{}", st.blocks + i + 1)), b)?;
+            }
+        }
+        let wave_bytes: usize = wave.iter().map(|b| b.len()).sum();
+        crate::lzx::set_share(wave_bytes.div_ceil(threads));
+        let packed = par::map(&wave, workers, |b| {
+            let p = pack_block(b, o.mode, threads);
+            crate::progress::block(b.len() as u64);
+            p
+        });
         drop(wave);
         for p in packed {
             let mut h = Vec::with_capacity(24);
@@ -367,6 +403,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
             st.in_bytes += p.raw_len as u64;
             st.out_bytes += (h.len() + p.data.len()) as u64;
             st.blocks += 1;
+            st.largest = st.largest.max(p.raw_len as u64);
             if o.verbose {
                 eprintln!("  block {:>4}: {:>11} -> {:>11} {}", st.blocks, p.raw_len, p.data.len(), p.note);
             }
@@ -451,7 +488,7 @@ fn unpack_block(b: &Raw, threads: usize) -> io::Result<Vec<u8>> {
         KIND_LZX => unpack_lz(&b.data, b.raw_len, threads).map_err(|e| bad(&e))?,
         _ => return Err(bad("unknown block kind")),
     };
-    if out.len() != b.raw_len || crc32(&out) != b.crc {
+    if out.len() != b.raw_len || crate::codec::crc32_par(&out, threads) != b.crc {
         return Err(bad("CRC mismatch: archive is corrupt"));
     }
     Ok(out)
@@ -485,7 +522,15 @@ pub fn decompress<R: Read, W: Write>(mut input: R, h: &Header, mut out: W, threa
             input.read_exact(&mut data)?;
             wave.push(Raw { kind, raw_len, crc, data });
         }
-        for r in par::map(&wave, workers, |b| unpack_block(b, threads)) {
+        let unpacked = par::map(&wave, workers, |b| {
+            trace("block decode start", b.raw_len);
+            let r = unpack_block(b, threads);
+            trace("block decoded", b.raw_len);
+            crate::progress::block(b.raw_len as u64);
+            r
+        });
+        trace("wave decoded", 0);
+        for r in unpacked {
             let d = r?;
             out.write_all(&d)?;
             written += d.len() as u64;

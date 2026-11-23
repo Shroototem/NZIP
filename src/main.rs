@@ -11,6 +11,7 @@ mod lz;
 mod lzx;
 mod mixer;
 mod par;
+mod progress;
 mod sais;
 mod sys;
 mod tables;
@@ -27,18 +28,21 @@ const USAGE: &str = "\
 nzip 1.0 - universal lossless compressor
 
 USAGE:
-  nzip c [options] <file|folder> [-o out.nz]   compress (default output: <input>.nz)
-  nzip d [options] <archive.nz>  [-o out]       decompress
-  nzip t [options] <archive.nz>                 test archive integrity
-  nzip bench [options] <file>                   compress + decompress in memory, verify
-  nzip info                                     show detected hardware
+  nzip -c [options] <file|folder> [-o out.nz]   compress (default output: <input>.nz)
+  nzip -d [options] <archive.nz>  [-o out]       decompress
+  nzip -t [options] <archive.nz>                 test archive integrity
+  nzip --bench [options] <file>                  compress + decompress in memory, verify
+  nzip --info                                    show detected hardware
 
 MODES:
   (default)     max:  best compression that stays fast (word transform + BWT + neural CM coder)
   --fast        fast: maximum speed (LZ77 on every core)
 
 OPTIONS:
-  -t N          threads (default: all logical CPUs, reduced to fit free RAM)
+  --cpu PCT     share of logical CPUs to use, 1-100 (default 99, so the desktop
+                keeps a core)
+  -T N          exact number of threads (overrides --cpu)
+  -p            show a progress bar
   -b SIZE       block size, e.g. 64M (default: automatic from cores, free RAM and VRAM)
   -m SIZE       memory budget, e.g. 4G (default: 90% of total RAM); fewer blocks run at once
   -f            overwrite existing output
@@ -51,6 +55,7 @@ struct Args {
     output: Option<PathBuf>,
     mode: Mode,
     threads: usize,
+    progress: bool,
     block: Option<usize>,
     force: bool,
     verbose: bool,
@@ -67,22 +72,46 @@ fn parse_size(s: &str) -> Option<usize> {
 }
 
 fn parse() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
-    let cmd = it.next().ok_or_else(|| USAGE.to_string())?;
+    let mut it = std::env::args().skip(1).peekable();
+    // a bare first word selects a developer command (lzsize, bwtsize, ...)
+    let dev = match it.peek() {
+        Some(w) if matches!(w.as_str(), "bwtsize" | "lzsize" | "lzsplit") => it.next(),
+        _ => None,
+    };
     let mut a = Args {
-        cmd,
+        cmd: dev.unwrap_or_default(),
         input: None,
         output: None,
         mode: Mode::Max,
-        threads: sys::cpus(),
+        threads: 0,
+        progress: false,
         block: None,
         force: false,
         verbose: false,
     };
+    let mut cpu_pct = 99usize;
+    let set_cmd = |a: &mut Args, c: &str| -> Result<(), String> {
+        if !a.cmd.is_empty() && a.cmd != c {
+            return Err(format!("choose one of -c, -d, -t, --bench, --info\n\n{USAGE}"));
+        }
+        a.cmd = c.to_string();
+        Ok(())
+    };
     while let Some(x) = it.next() {
         match x.as_str() {
+            "-c" | "--compress" => set_cmd(&mut a, "c")?,
+            "-d" | "--decompress" => set_cmd(&mut a, "d")?,
+            "-t" | "--test" => set_cmd(&mut a, "t")?,
+            "--bench" => set_cmd(&mut a, "bench")?,
+            "--info" => set_cmd(&mut a, "info")?,
+            "-h" | "--help" => return Err(USAGE.to_string()),
             "-o" => a.output = Some(it.next().ok_or("-o needs a path")?.into()),
-            "-t" => a.threads = it.next().and_then(|v| v.parse().ok()).filter(|&n| n > 0).ok_or("-t needs a number")?,
+            "--cpu" => {
+                let p: usize = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| (1..=100).contains(p)).ok_or("--cpu needs a percentage 1-100")?;
+                cpu_pct = p;
+            }
+            "-p" | "--progress" => a.progress = true,
+            "-T" => a.threads = it.next().and_then(|v| v.parse().ok()).filter(|&n| n > 0).ok_or("-T needs a number")?,
             "-b" => a.block = Some(it.next().as_deref().and_then(parse_size).filter(|&n| n > 0).ok_or("-b needs a size")?),
             "-m" => {
                 let m = it.next().as_deref().and_then(parse_size).filter(|&n| n > 0).ok_or("-m needs a size")?;
@@ -95,6 +124,12 @@ fn parse() -> Result<Args, String> {
             s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{USAGE}")),
             _ => a.input = Some(x.into()),
         }
+    }
+    if a.cmd.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    if a.threads == 0 {
+        a.threads = (sys::cpus() * cpu_pct / 100).max(1);
     }
     Ok(a)
 }
@@ -123,18 +158,21 @@ fn run(a: Args) -> io::Result<()> {
             });
             let t0 = Instant::now();
             let out = BufWriter::with_capacity(1 << 20, create_out(&out_path, a.force)?);
-            let st = if input.is_dir() {
+            let (src, total, flags, cuts): (Box<dyn io::Read>, u64, u8, Vec<u64>) = if input.is_dir() {
                 let entries = archive::scan(&input)?;
                 let (r, total, cuts) = archive::PackReader::new(&entries);
-                container::compress(BufReader::with_capacity(1 << 20, r), total, FLAG_DIR, out, &opts, &cuts)?
+                (Box::new(r), total, FLAG_DIR, cuts)
             } else {
                 let f = File::open(&input)?;
                 let total = f.metadata()?.len();
-                container::compress(BufReader::with_capacity(1 << 20, f), total, 0, out, &opts, &[])?
+                (Box::new(f), total, 0, Vec::new())
             };
+            let bar = progress::start("compressing", total, a.progress);
+            let st = container::compress(BufReader::with_capacity(1 << 20, src), total, flags, out, &opts, &cuts)?;
+            drop(bar);
             let dt = t0.elapsed().as_secs_f64();
             eprintln!(
-                "{} -> {}: {} -> {} bytes ({:.3}%, {:.4} bpb) in {:.2}s, {:.2} MB/s [{:?}, {} blocks of {} MB, {} at once]",
+                "{} -> {}: {} -> {} bytes ({:.3}%, {:.4} bpb) in {:.2}s, {:.2} MB/s [{:?}, {} blocks (largest {} MB), {} threads]",
                 input.display(),
                 out_path.display(),
                 st.in_bytes,
@@ -145,8 +183,8 @@ fn run(a: Args) -> io::Result<()> {
                 mb(st.in_bytes) / dt,
                 opts.mode,
                 st.blocks,
-                st.block_size >> 20,
-                st.threads
+                st.largest.div_ceil(1 << 20),
+                opts.threads
             );
         }
         "d" | "decompress" | "t" | "test" => {
@@ -155,6 +193,7 @@ fn run(a: Args) -> io::Result<()> {
             let t0 = Instant::now();
             let mut r = BufReader::with_capacity(1 << 20, File::open(&input)?);
             let h = container::read_header(&mut r)?;
+            let bar = progress::start(if test { "testing" } else { "decompressing" }, h.total, a.progress);
             let n = if test {
                 container::decompress(r, &h, io::sink(), a.threads)?
             } else {
@@ -175,6 +214,7 @@ fn run(a: Args) -> io::Result<()> {
                     container::decompress(r, &h, out, a.threads)?
                 }
             };
+            drop(bar);
             if n != h.total {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("size mismatch: {n} != {}", h.total)));
             }
@@ -249,7 +289,7 @@ fn run(a: Args) -> io::Result<()> {
                 x86::encode(&mut data);
             }
             let t0 = Instant::now();
-            let c = lzx::encode(&data, a.threads, x86);
+            let c = lzx::encode(&data, a.threads, x86, x86);
             let t1 = Instant::now();
             let mut d = lzx::decode(&c, data.len(), a.threads, x86).unwrap();
             let t2 = Instant::now();
@@ -268,11 +308,17 @@ fn run(a: Args) -> io::Result<()> {
             // dev: x86 split streams, each through the LZ engine
             let data = std::fs::read(need_input()?)?;
             let t0 = Instant::now();
-            let sp = x86::split(&data);
-            let cm = lzx::encode(&sp.main, a.threads, false);
-            let cf = lzx::encode(&sp.flags, a.threads, false);
-            let ca = lzx::encode(&sp.addr, a.threads, false);
-            let cj = lzx::encode(&sp.jump, a.threads, false);
+            let (sp, lens) = x86::split_chunks(&data, a.threads);
+            if let Some(d) = std::env::var_os("NZ_DUMP") {
+                let d = PathBuf::from(d);
+                for (n, v) in [("main", &sp.main), ("flags", &sp.flags), ("call", &sp.addr), ("jump", &sp.jump)] {
+                    std::fs::write(d.join(n), v)?;
+                }
+            }
+            let cm = lzx::encode(&sp.main, a.threads, false, true);
+            let cf = lzx::encode(&sp.flags, a.threads, false, true);
+            let ca = lzx::encode(&sp.addr, a.threads, false, true);
+            let cj = lzx::encode(&sp.jump, a.threads, false, true);
             let t1 = Instant::now();
             if std::env::var_os("NZ_ENCONLY").is_some() {
                 println!("{} -> {} (main {}) | c {:.2}s", data.len(), cm.len() + cf.len() + ca.len() + cj.len(), cm.len(), (t1 - t0).as_secs_f64());
@@ -282,7 +328,7 @@ fn run(a: Args) -> io::Result<()> {
             let f = lzx::decode(&cf, sp.flags.len(), a.threads, false).unwrap();
             let ad = lzx::decode(&ca, sp.addr.len(), a.threads, false).unwrap();
             let jd = lzx::decode(&cj, sp.jump.len(), a.threads, false).unwrap();
-            let back = x86::join(&m, &f, &ad, &jd, data.len()).unwrap();
+            let back = x86::join_chunks([&m, &f, &ad, &jd], &lens, data.len(), a.threads).unwrap();
             let t2 = Instant::now();
             assert!(back == data);
             println!(
@@ -316,6 +362,7 @@ fn main() {
         }
     };
     let verbose = a.verbose;
+    par::set_threads(a.threads);
     if let Err(e) = run(a) {
         eprintln!("nzip: {e}");
         std::process::exit(1);

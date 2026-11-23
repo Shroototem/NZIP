@@ -313,3 +313,67 @@ extern "C" __global__ void sa_bwt(const unsigned char* __restrict__ s, const u32
     out[r] = p ? s[p - 1] : s[n - 1];
     if (p % seg == 0) idx[p / seg] = r + 1;
 }
+
+// ------------------------------------------------------------------ inverse BWT walk
+
+// One thread per chain: chain t starts at matrix row rows[t] and emits text positions
+// [t*seg, min((t+1)*seg, n)), following psi. fin[t] = the row after the last step, which
+// the host checks against rows[t+1] (a corrupt walk cannot land there by accident).
+extern "C" __global__ void ub_walk(const u32* __restrict__ psi, const u32* __restrict__ rows, u32 k, u32 seg,
+                                   u32 n, const u32* __restrict__ c1g, unsigned char* out, u32* fin) {
+    __shared__ u32 c1[257];
+    for (u32 i = threadIdx.x; i < 257; i += blockDim.x) c1[i] = c1g[i];
+    __syncthreads();
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= k) return;
+    unsigned long long s0 = (unsigned long long)t * seg;
+    if (s0 >= n) return;
+    u32 start = (u32)s0;
+    u32 end = min(start + seg, n);
+    u32 r = rows[t];
+    for (u32 i = start; i < end; i++) {
+        u32 lo = 0;
+        for (u32 step = 128; step; step >>= 1)
+            if (c1[lo + step] <= r) lo += step;
+        out[i] = (unsigned char)lo;
+        r = psi[r];
+    }
+    fin[t] = r;
+}
+
+// Inverse BWT index on the device: psi[F-row] = L-row, a stable counting sort of the rows
+// of L' by character. L'[0] = b[p1-1], L'[p1] = '$' (skipped), L'[r] = b[r-1] otherwise.
+#define UB_T 2048
+__device__ __forceinline__ u32 ub_lch(const unsigned char* b, u32 r, u32 p1) { return r ? b[r - 1] : b[p1 - 1]; }
+
+// counts[c * tiles + t] = occurrences of c in tile t (UB_T rows each).
+extern "C" __global__ void ub_count(const unsigned char* __restrict__ b, u32 rows, u32 p1, u32 tiles, u32* counts) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tiles) return;
+    u32 c[256];
+    for (int i = 0; i < 256; i++) c[i] = 0;
+    u32 a = t * UB_T, z = min(a + UB_T, rows);
+    for (u32 r = a; r < z; r++)
+        if (r != p1) c[ub_lch(b, r, p1)]++;
+    for (int i = 0; i < 256; i++) counts[i * tiles + t] = c[i];
+}
+
+// After an exclusive scan of counts: write psi (F rows start at 1; row 0 is '$').
+extern "C" __global__ void ub_scatter(const unsigned char* __restrict__ b, u32 rows, u32 p1, u32 tiles,
+                                      const u32* __restrict__ offs, u32* psi) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tiles) return;
+    u32 o[256];
+    for (int i = 0; i < 256; i++) o[i] = offs[i * tiles + t] + 1;
+    u32 a = t * UB_T, z = min(a + UB_T, rows);
+    for (u32 r = a; r < z; r++)
+        if (r != p1) psi[o[ub_lch(b, r, p1)]++] = r;
+    if (t == 0) psi[0] = p1;
+}
+
+// c1[c] = first F row of character c; c1[256] = rows.
+extern "C" __global__ void ub_c1(const u32* __restrict__ offs, u32 tiles, u32 rows, u32* c1) {
+    u32 c = threadIdx.x;
+    c1[c] = offs[c * tiles] + 1;
+    if (c == 0) c1[256] = rows;
+}

@@ -1,7 +1,6 @@
 //! Binary arithmetic coder (32-bit, carry-less). Probabilities are 16-bit integers, so the
 //! coder works the same on every machine.
 
-use crate::mixer::Mixer;
 use crate::tables::stretch;
 
 pub struct Encoder {
@@ -25,6 +24,27 @@ impl Encoder {
         } else {
             self.x1 = xmid + 1;
         }
+        while (self.x1 ^ self.x2) & 0xff00_0000 == 0 {
+            self.out.push((self.x2 >> 24) as u8);
+            self.x1 <<= 8;
+            self.x2 = (self.x2 << 8) | 255;
+        }
+    }
+
+    /// Codes the low `k` bits of `v` (k <= 16) as equally likely, in one step when the
+    /// range is wide enough, else bit by bit (the decoder makes the same choice).
+    #[inline(always)]
+    pub fn encode_direct(&mut self, v: u32, k: u32) {
+        let range = self.x2 - self.x1;
+        if range >> (k + 8) == 0 {
+            for i in (0..k).rev() {
+                self.encode((v >> i) & 1, 32768);
+            }
+            return;
+        }
+        let step = range >> k;
+        self.x1 += v * step;
+        self.x2 = self.x1 + step - 1;
         while (self.x1 ^ self.x2) & 0xff00_0000 == 0 {
             self.out.push((self.x2 >> 24) as u8);
             self.x1 <<= 8;
@@ -83,6 +103,29 @@ impl<'a> Decoder<'a> {
         bit
     }
 
+    /// Inverse of `Encoder::encode_direct`.
+    #[inline(always)]
+    pub fn decode_direct(&mut self, k: u32) -> u32 {
+        let range = self.x2 - self.x1;
+        if range >> (k + 8) == 0 {
+            let mut v = 0;
+            for _ in 0..k {
+                v = (v << 1) | self.decode(32768);
+            }
+            return v;
+        }
+        let step = range >> k;
+        let v = ((self.x - self.x1) / step).min((1 << k) - 1);
+        self.x1 += v * step;
+        self.x2 = self.x1 + step - 1;
+        while (self.x1 ^ self.x2) & 0xff00_0000 == 0 {
+            self.x1 <<= 8;
+            self.x2 = (self.x2 << 8) | 255;
+            self.x = (self.x << 8) | self.byte();
+        }
+        v
+    }
+
     /// True if the decoder read past the end of its input (corrupt or truncated data).
     pub fn overrun(&self) -> bool {
         self.pos > self.src.len() + 4
@@ -93,6 +136,8 @@ impl<'a> Decoder<'a> {
 pub trait BitIo {
     /// Codes `bit` (ignored when decoding) with P(1) = p/65536; returns the actual bit.
     fn code(&mut self, bit: u32, p: u32) -> u32;
+    /// Codes `k` (<= 16) equally likely bits of `v` (ignored when decoding).
+    fn direct(&mut self, v: u32, k: u32) -> u32;
 }
 
 impl BitIo for Encoder {
@@ -101,12 +146,21 @@ impl BitIo for Encoder {
         self.encode(bit, p);
         bit
     }
+    #[inline(always)]
+    fn direct(&mut self, v: u32, k: u32) -> u32 {
+        self.encode_direct(v, k);
+        v
+    }
 }
 
 impl BitIo for Decoder<'_> {
     #[inline(always)]
     fn code(&mut self, _bit: u32, p: u32) -> u32 {
         self.decode(p)
+    }
+    #[inline(always)]
+    fn direct(&mut self, _v: u32, k: u32) -> u32 {
+        self.decode_direct(k)
     }
 }
 
@@ -117,10 +171,10 @@ pub struct Dual(pub [u16; 2]);
 
 impl Dual {
     pub const INIT: Dual = Dual([32768; 2]);
+    /// Both logits (scaled by 256).
     #[inline(always)]
-    pub fn add(self, m: &mut Mixer) {
-        m.add(stretch(self.0[0] as i32 >> 4));
-        m.add(stretch(self.0[1] as i32 >> 4));
+    pub fn st2(self) -> (i32, i32) {
+        (stretch(self.0[0] as i32 >> 4), stretch(self.0[1] as i32 >> 4))
     }
     #[inline(always)]
     pub fn update(&mut self, y: u32, fast: u32, slow: u32) {
