@@ -676,20 +676,23 @@ pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
 }
 
 fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, Vec<(u32, u32)>)> {
-    let m = gpu()?;
-    // a busy GPU is not waited for: the CPU match finder takes this piece, so the GPU and
-    // every core stay busy (which pieces the GPU gets then depends on timing; any choice
-    // decodes the same)
-    let mut g = match m.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) if !crate::sys::dev_flag("NZ_GPUWAIT") => return None,
-        Err(_) => lock(m),
+    let Some(m) = gpu() else {
+        if crate::sys::dev_flag("NZIP_TRACE") {
+            eprintln!("  gpu match lists: no GPU ({})", GPU_ERR.get().map_or("off", |e| e.as_str()));
+        }
+        return None;
     };
+    // a busy GPU is waited for: its lists beat the CPU match finder on time and size, and
+    // which pieces get them then does not depend on timing (same archive every run)
+    let mut g = lock(m);
     if g.disabled {
         return None;
     }
     unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
     if g.free_mem() < vram_need(s.len()) + s.len() as u64 * 24 {
+        if crate::sys::dev_flag("NZIP_TRACE") {
+            eprintln!("  gpu match lists: {} MB does not fit in free VRAM", s.len() >> 20);
+        }
         return None;
     }
     let t0 = std::time::Instant::now();

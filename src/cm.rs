@@ -7,7 +7,6 @@
 
 use crate::tables::{squash, stretch};
 
-
 /// First step of a young counter: 1/2^YOUNG_START.
 pub const YOUNG_START: u32 = 2;
 
@@ -23,24 +22,6 @@ impl Ctr {
     #[inline(always)]
     pub fn st(self) -> i32 {
         stretch(self.p as i32 >> 4)
-    }
-
-    #[inline(always)]
-    pub fn p(self) -> u32 {
-        self.p as u32
-    }
-
-    /// Like `update`, but a young counter learns fast: the low 3 bits count the bits seen,
-    /// and the step is 1/2^(count + START) until it reaches 1/2^rate. Models that restart
-    /// often (every LZ sub-block) lose much less to the cold start.
-    #[inline(always)]
-    pub fn update_young(&mut self, y: u32, rate: u32) {
-        let n = (self.p & 7) as u32;
-        let r = (n + YOUNG_START).min(rate);
-        let t = ((y << 16) - y) as i32;
-        let p = (self.p & !7) as i32;
-        let q = (p + ((t - p) >> r)) as u16;
-        self.p = (q & !7) | (n + 1).min(7) as u16;
     }
 
     /// Moves P(1) toward the coded bit by 1/2^rate.
@@ -104,6 +85,64 @@ impl<const K: usize> Mix<K> {
         }
     }
 }
+
+/// Mixer with 32-bit arithmetic over `K` inputs (pad unused inputs with 0) so the dot
+/// product and the update vectorize; weights 16384 = 1.0, kept within +-8 so a dot product
+/// of 8 inputs of |x| <= 2047 cannot overflow.
+#[derive(Clone)]
+pub struct MixV<const K: usize> {
+    w: Vec<[i32; K]>,
+    x: [i32; K],
+    row: usize,
+    pr: i32,
+    lr: i32,
+}
+
+const WMAX: i32 = 130_000;
+
+impl<const K: usize> MixV<K> {
+    pub fn new(rows: usize, lr: i32, inputs: usize) -> Self {
+        let mut init = [0i32; K];
+        for v in init.iter_mut().take(inputs) {
+            *v = (16384 / inputs as i32) * 2;
+        }
+        MixV { w: vec![init; rows], x: [0; K], row: 0, pr: 2048, lr }
+    }
+
+    #[inline(always)]
+    fn dot(x: &[i32; K], w: &[i32; K]) -> i32 {
+        let mut s = 0i32;
+        for i in 0..K {
+            s = s.wrapping_add(x[i].wrapping_mul(w[i]));
+        }
+        s
+    }
+
+    /// P(1) as a 12-bit probability; remembers the inputs for `update`.
+    #[inline(always)]
+    pub fn predict12(&mut self, x: [i32; K], row: usize) -> i32 {
+        self.x = x;
+        self.row = row;
+        self.pr = squash(Self::dot(&x, &self.w[row]) >> 14);
+        self.pr
+    }
+
+    /// Same prediction without remembering anything.
+    #[inline(always)]
+    pub fn peek12(&self, x: &[i32; K], row: usize) -> i32 {
+        squash(Self::dot(x, &self.w[row]) >> 14)
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, y: u32) {
+        let err = (((y as i32) << 12) - self.pr) * self.lr;
+        let w = &mut self.w[self.row];
+        for i in 0..K {
+            w[i] = (w[i] + ((self.x[i] * err) >> 15)).clamp(-WMAX, WMAX);
+        }
+    }
+}
+
 
 /// 16 counters for the 4 bits of one nibble (tree nodes 1..15; slot 0 unused), in one
 /// half cache line: a byte touches two groups per table instead of up to 8 lines.

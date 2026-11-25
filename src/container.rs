@@ -19,7 +19,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -95,10 +95,11 @@ pub const MAX_BLOCK: usize = 256 << 20;
 /// Picks the block size from the input size, the hardware and free RAM / VRAM.
 /// * Max + usable GPU: blocks as large as free VRAM, free RAM and MAX_BLOCK allow (the GPU
 ///   sorts them in turn while every CPU thread codes); bigger blocks compress better.
-/// * Max, CPU only: about one block per thread, since each suffix sort runs on one thread.
+/// * Max, CPU only: the same size cap from free RAM. Both engines run every core inside
+///   one block (coder segments, LZ pieces), and small blocks cost 2-25% (executables lose
+///   cross-section matches, text loses context); a 256 MB CPU sort still beats 7-Zip's time.
 /// Blocks are split evenly. The archive records the size, so decoding adapts to any machine.
-pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
-    let threads = threads.max(1) as u64;
+pub fn choose_block_size(total: u64, mode: Mode) -> usize {
     let total = total.max(1);
     let even = |cap: u64| -> usize {
         let cap = cap.max(1 << 20);
@@ -116,22 +117,11 @@ pub fn choose_block_size(total: u64, mode: Mode, threads: usize) -> usize {
                     let by_vram = v.saturating_sub(256 << 20) / 34;
                     even(by_vram.min(ram / 7).min(MAX_BLOCK as u64))
                 }
-                _ => {
-                    // both engines run every core inside one block (coder segments, LZ
-                    // pieces), so blocks are as big as the CPU sorter allows: small blocks
-                    // cost 2-25% (executables lose cross-section matches, text loses
-                    // context), and even a 128 MB CPU sort beats 7-Zip's time
-                    let per = total.div_ceil(threads).max(CPU_BLOCK as u64);
-                    let by_ram = (ram / 7).max(8 << 20);
-                    even(per.min(by_ram).min(CPU_BLOCK as u64))
-                }
+                _ => even((ram / 7).max(8 << 20).min(MAX_BLOCK as u64)),
             }
         }
     }
 }
-
-/// Largest block when the CPU sorts (one sort per thread).
-pub const CPU_BLOCK: usize = 128 << 20;
 
 /// Blocks that can be in flight within the memory budget (at least 1).
 pub fn fit_threads(want: usize, per_block: u64) -> usize {
@@ -234,6 +224,7 @@ fn lz_payload(data: &[u8], x86: bool, threads: usize, arr: usize) -> Vec<u8> {
         out.push(0);
         out.extend_from_slice(&crate::lzx::encode(data, threads, false, false, arr));
     }
+    trace("lz done", data.len());
     out
 }
 
@@ -507,7 +498,7 @@ pub struct Stats {
 
 /// `cuts`: sorted stream offsets where a block boundary is preferred (file / type changes).
 pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out: W, o: &Options, cuts: &[u64]) -> io::Result<Stats> {
-    let bs = o.block_size.unwrap_or_else(|| choose_block_size(total, o.mode, o.threads)).max(1);
+    let bs = o.block_size.unwrap_or_else(|| choose_block_size(total, o.mode)).max(1);
     let threads = o.threads.max(1);
     // blocks in flight: limited by free RAM; spare threads work inside each block
     let workers = fit_threads(threads, block_mem(o.mode, bs));

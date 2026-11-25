@@ -284,7 +284,7 @@ fn run(a: Args) -> io::Result<()> {
             println!("RAM          : {:.1} GB total, {:.1} GB free, budget {:.1} GB", sys::total_ram() as f64 / 1e9, sys::free_ram() as f64 / 1e9, sys::mem_budget() as f64 / 1e9);
             println!("AVX2 path    : {}", if codec::has_avx2() { "yes" } else { "no (portable path, same output)" });
             println!("GPU          : {}", gpu::describe());
-            let bs = container::choose_block_size(1 << 40, Mode::Max, sys::cpus());
+            let bs = container::choose_block_size(1 << 40, Mode::Max);
             println!("max block    : {} MB here (decoding it needs ~{} MB RAM)", bs >> 20, container::block_mem(Mode::Max, bs) >> 20);
         }
         _ => {

@@ -12,7 +12,7 @@
 //!
 //! Prices only steer the encoder's choices; the decoder never computes them.
 
-use crate::cm::{G, NG, hg};
+use crate::cm::{G, MixV, NG, hg};
 use crate::coder::{BitIo, Decoder, Encoder};
 
 /// Largest independent sub-block (sub-blocks run in parallel in both directions).
@@ -125,7 +125,9 @@ impl Prob {
     fn p(self) -> u32 {
         (self.0 as u32).clamp(64, 65535 - 64)
     }
-    /// Rate 1/32, faster while young (count in the low 3 bits, as `Ctr::update_young`).
+    /// Rate 1/32, faster while young: the low 3 bits count the bits seen, and the step is
+    /// 1/2^(count + YOUNG_START) until it reaches 1/32, so each sub-block's cold start
+    /// costs less.
     #[inline(always)]
     fn update(&mut self, b: u32) {
         let n = (self.0 & 7) as u32;
@@ -297,21 +299,19 @@ impl DistCoder {
 
 // ---------------------------------------------------------------- literal model
 
-/// Literal model: two counters per bit, a fast one and a slow twin (rates LRATE and
-/// LRATE + 2), averaged. Their context is the match byte for the literal right after a
-/// match, the operand context inside the rel32 target of an x86 branch, else the previous
-/// byte; the second nibble's counters are also keyed by the first nibble.
+/// Literal model: per bit, counters in three contexts (the previous byte, the match byte,
+/// and inside the rel32 target of an x86 branch the operand context) go through a small
+/// mixer whose weight set is chosen by the bits seen so far, the matched flag and the
+/// operand byte index. The second nibble's counters are also keyed by the first nibble.
 #[derive(Clone)]
 struct Lit {
     t1: Vec<G>,
-    s1: Vec<G>,
     tm: Vec<G>,
-    sm: Vec<G>,
     tx: Vec<G>,
-    sx: Vec<G>,
+    m: MixV<8>,
 }
 
-/// Counter rate (shift) of the fast counters.
+/// Counter rate (shift) of the literal counters.
 const LRATE: u32 = 4;
 const TX_BITS: u32 = 18;
 
@@ -341,43 +341,12 @@ fn op_ctx(buf: &[u8], pos: usize, base: usize) -> (usize, u32) {
 }
 
 impl Lit {
-    fn new() -> Lit {
+    fn new(x86ctx: bool) -> Lit {
         Lit {
             t1: vec![G::INIT; 256 * NG],
-            s1: vec![G::INIT; 256 * NG],
             tm: vec![G::INIT; 256 * NG],
-            sm: vec![G::INIT; 256 * NG],
-            tx: vec![G::INIT; 1 << TX_BITS],
-            sx: vec![G::INIT; 1 << TX_BITS],
-        }
-    }
-
-    /// Index of the counter groups for nibble selector `sel`, and which pair of tables
-    /// holds them (0 = previous byte, 1 = match byte, 2 = x86 operand).
-    #[inline(always)]
-    fn slot(sel: usize, prev: u32, mb: u32, matched: bool, xc: Option<u32>) -> (u8, usize) {
-        match xc {
-            _ if matched => (1, mb as usize * NG + sel),
-            Some(x) => (2, hg(x + sel as u32, TX_BITS)),
-            None => (0, prev as usize * NG + sel),
-        }
-    }
-
-    #[inline(always)]
-    fn pair(&self, t: u8, i: usize) -> (&G, &G) {
-        match t {
-            1 => (&self.tm[i], &self.sm[i]),
-            2 => (&self.tx[i], &self.sx[i]),
-            _ => (&self.t1[i], &self.s1[i]),
-        }
-    }
-
-    #[inline(always)]
-    fn pair_mut(&mut self, t: u8, i: usize) -> (&mut G, &mut G) {
-        match t {
-            1 => (&mut self.tm[i], &mut self.sm[i]),
-            2 => (&mut self.tx[i], &mut self.sx[i]),
-            _ => (&mut self.t1[i], &mut self.s1[i]),
+            tx: vec![G::INIT; if x86ctx { 1 << TX_BITS } else { NG }],
+            m: MixV::new(256 * 2 * 5, 4, 6),
         }
     }
 
@@ -388,25 +357,29 @@ impl Lit {
         (k != 0).then(|| (((k as u32) << 16) | octx).wrapping_mul(NG as u32))
     }
 
-    #[inline(always)]
-    fn p(a: &G, b: &G, j: usize) -> u32 {
-        ((a.0[j].p() + b.0[j].p()) >> 1).clamp(48, 65535 - 48)
-    }
-
     /// Codes (or decodes, per `io`) one literal; `mb` = match byte, `op` = op_ctx.
     #[inline(always)]
     fn code<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+        let Lit { t1, tm, tx, m } = self;
         let xc = Self::xc(op);
+        let row = ((matched as usize) << 8) | (op.0 << 9);
         let mut c0 = 1usize;
         for half in 0..2 {
             let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-            let (t, i) = Self::slot(sel, prev, mb, matched, xc);
-            let (fa, sa) = self.pair_mut(t, i);
+            let g1 = &mut t1[prev as usize * NG + sel].0;
+            let gm = &mut tm[mb as usize * NG + sel].0;
+            let mut gx = xc.map(|x| &mut tx[hg(x + sel as u32, TX_BITS)].0);
             let mut j = 1usize;
             for q in 0..4 {
-                let b = io.code((byte >> (7 - (half * 4 + q))) & 1, Self::p(fa, sa, j));
-                fa.0[j].update_young(b, LRATE);
-                sa.0[j].update_young(b, LRATE + 2);
+                let x = [g1[j].st(), 0, gm[j].st(), 0, gx.as_ref().map_or(0, |g| g[j].st()), 0, 256, 0];
+                let p = ((m.predict12(x, c0 | row) << 4) as u32).clamp(48, 65535 - 48);
+                let b = io.code((byte >> (7 - (half * 4 + q))) & 1, p);
+                m.update(b);
+                g1[j].update(b, LRATE);
+                gm[j].update(b, LRATE);
+                if let Some(g) = gx.as_mut() {
+                    g[j].update(b, LRATE);
+                }
                 j = (j << 1) | b as usize;
                 c0 = (c0 << 1) | b as usize;
             }
@@ -414,20 +387,53 @@ impl Lit {
         (c0 & 255) as u32
     }
 
-    /// Cost (1/16 bit) of `byte` under the model as it stands (no updates).
+    /// Cheaper estimate of `cost` for the one-arrival parse (few cores, bulk data): the
+    /// context counters' logits averaged with fixed weights instead of mixed. Measured
+    /// slightly smaller as well as faster there.
     #[inline(always)]
-    fn cost(&self, t: &[u32], byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+    fn cost_fast(&self, t: &[u32], byte: u32, prev: u32, mb: u32, op: (usize, u32)) -> u32 {
         let xc = Self::xc(op);
         let mut c0 = 1usize;
         let mut s = 0;
         for half in 0..2 {
             let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-            let (tb, i) = Self::slot(sel, prev, mb, matched, xc);
-            let (fa, sa) = self.pair(tb, i);
+            let g1 = &self.t1[prev as usize * NG + sel].0;
+            let gm = &self.tm[mb as usize * NG + sel].0;
+            let gx = xc.map(|x| &self.tx[hg(x + sel as u32, TX_BITS)].0);
             let mut j = 1usize;
             for q in 0..4 {
                 let b = (byte >> (7 - (half * 4 + q))) & 1;
-                s += pr(t, Prob(Self::p(fa, sa, j) as u16), b);
+                let d = match gx {
+                    Some(g) => (g1[j].st() + gm[j].st() + g[j].st()) * 11 >> 5,
+                    None => (g1[j].st() + gm[j].st()) >> 1,
+                };
+                let p1 = crate::tables::squash(d).clamp(1, 4095) as u32;
+                s += t[(if b == 1 { p1 } else { 4096 - p1 }) as usize];
+                j = (j << 1) | b as usize;
+                c0 = (c0 << 1) | b as usize;
+            }
+        }
+        s
+    }
+
+    /// Cost (1/16 bit) of `byte` under the model as it stands (no updates).
+    #[inline(always)]
+    fn cost(&self, t: &[u32], byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+        let xc = Self::xc(op);
+        let row = ((matched as usize) << 8) | (op.0 << 9);
+        let mut c0 = 1usize;
+        let mut s = 0;
+        for half in 0..2 {
+            let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
+            let g1 = &self.t1[prev as usize * NG + sel].0;
+            let gm = &self.tm[mb as usize * NG + sel].0;
+            let gx = xc.map(|x| &self.tx[hg(x + sel as u32, TX_BITS)].0);
+            let mut j = 1usize;
+            for q in 0..4 {
+                let b = (byte >> (7 - (half * 4 + q))) & 1;
+                let x = [g1[j].st(), 0, gm[j].st(), 0, gx.map_or(0, |g| g[j].st()), 0, 256, 0];
+                let p1 = self.m.peek12(&x, c0 | row).clamp(1, 4095) as u32;
+                s += t[(if b == 1 { p1 } else { 4096 - p1 }) as usize];
                 j = (j << 1) | b as usize;
                 c0 = (c0 << 1) | b as usize;
             }
@@ -580,7 +586,7 @@ impl Model {
             mlen: LenCoder::new(),
             rlen: LenCoder::new(),
             dist: DistCoder::new(),
-            lit: Lit::new(),
+            lit: Lit::new(x86ctx),
             flags: Vec::new(),
             seg_end: 0,
             dense: false,
@@ -779,6 +785,15 @@ impl Mf {
     #[inline(always)]
     fn insert(&mut self, buf: &[u8], n: usize, p: usize) {
         self.walk(buf, n, p, None);
+    }
+
+    /// Inserts the history bytes [0, d0) (except dense segments).
+    fn insert_history(&mut self, buf: &[u8], n: usize, d0: usize, flags: &[bool]) {
+        for p in 0..d0 {
+            if !flags[p >> SEG_BITS] {
+                self.walk(buf, n, p, None);
+            }
+        }
     }
 
     #[inline(always)]
@@ -1025,7 +1040,7 @@ impl<const A: usize> Parser<A> {
                         Some(e) => e.1,
                         None => {
                             let op = if m.x86ctx { op_ctx(buf, pos, m.base) } else { (0, 0) };
-                            let c = m.lit.cost(t, buf[pos] as u32, prev, mb, s >= 7, op);
+                            let c = if A == 1 { m.lit.cost_fast(t, buf[pos] as u32, prev, mb, op) } else { m.lit.cost(t, buf[pos] as u32, prev, mb, s >= 7, op) };
                             lit_memo[a] = (key, c);
                             c
                         }
@@ -1158,7 +1173,38 @@ impl Lists {
         let i = pos - self.start;
         &self.m[self.idx[i] as usize..self.idx[i + 1] as usize]
     }
+
+    /// From lists of stream positions counted from `w0` (start 0), those of the sub-block
+    /// [base, base + len) as positions of its buffer, which starts `d0` bytes of history
+    /// before it: matches that start before the buffer are dropped, lengths stop at its
+    /// end, and each list keeps strictly increasing lengths.
+    fn window(&self, w0: usize, base: usize, d0: usize, len: usize) -> Lists {
+        let b0 = base - d0;
+        let end = base + len;
+        let mut idx = Vec::with_capacity(len + 1);
+        let mut m = Vec::with_capacity(len * 2);
+        idx.push(0);
+        for g in base..end {
+            let lp = (g - b0) as u32;
+            let maxl = (end - g).min(MAX_LEN) as u32;
+            let mut last = 0;
+            for &(l, d) in self.at(g - w0) {
+                let l = l.min(maxl);
+                if d < lp && l > last {
+                    m.push((l, d));
+                    last = l;
+                }
+            }
+            idx.push(m.len() as u32);
+        }
+        Lists { start: d0, idx, m }
+    }
 }
+
+/// Coded bytes per GPU match-list job: the sub-blocks of a chunk take their lists from
+/// one job over the chunk and its history, so the GPU indexes each history once per
+/// chunk rather than once per sub-block.
+const GPU_CHUNK: usize = 32 << 20;
 
 /// Bit sink that only replays the model (prices for a parse that is coded later).
 struct NullIo;
@@ -1275,8 +1321,8 @@ unsafe fn parse_seg_avx2(buf: &[u8], n: usize, start: &Model, lists: &Lists, s: 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn encode_mt_avx2(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, threads: usize, arr: usize) -> Vec<u8> {
-    encode_sub_mt(buf, n, d0, base, x86ctx, threads, arr)
+unsafe fn encode_mt_avx2(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, threads: usize, arr: usize, pre: Option<Lists>) -> Vec<u8> {
+    encode_sub_mt(buf, n, d0, base, x86ctx, threads, arr, pre)
 }
 
 
@@ -1286,7 +1332,7 @@ unsafe fn encode_mt_avx2(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: b
 /// the same; only the encoder's choices can differ slightly at segment starts.
 /// `buf[..d0]` is history from earlier sub-blocks (matched into, never coded); bytes
 /// [d0, n) are coded. `base` = stream offset of buf[0].
-fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, threads: usize, arr: usize) -> Vec<u8> {
+fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, threads: usize, arr: usize, pre: Option<Lists>) -> Vec<u8> {
     let flags = dense_segments(&buf[..n]);
     let mut m = Model::new(base, x86ctx);
     m.flags = flags.clone();
@@ -1294,14 +1340,9 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
     let mut view = View::new(n, d0);
     let segs: Vec<(usize, usize)> = (0..(n - d0).div_ceil(PSEG)).map(|i| (d0 + i * PSEG, (d0 + (i + 1) * PSEG).min(n))).collect();
     let mut pos = d0;
-    // the GPU finds every position's matches at once when it can (else the CPU match
-    // finder runs ahead on its own thread); history segments need no lists
-    let gpu = if !crate::sys::dev_flag("NZ_NOGPUMF") {
-        let skip: Vec<bool> = flags.iter().enumerate().map(|(i, &f)| f || (i + 1) << SEG_BITS <= d0).collect();
-        crate::gpu::match_lists(&buf[..n], SEG_BITS, &skip).map(|(idx, m)| Lists { start: 0, idx, m })
-    } else {
-        None
-    };
+    // lists from the GPU (`pre`, found for the whole chunk), else the CPU match finder
+    // runs ahead on its own thread
+    let gpu = pre;
     std::thread::scope(|sc| {
         // the match finder runs ahead on its own thread (it only depends on the data)
         let (tx, rx) = std::sync::mpsc::sync_channel::<Lists>(PROUND);
@@ -1313,11 +1354,7 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
                 return;
             }
             let mut mf = Mf::new(n);
-            for p in 0..d0 {
-                if !fl[p >> SEG_BITS] {
-                    mf.insert(buf, n, p);
-                }
-            }
+            mf.insert_history(buf, n, d0, fl);
             for &(s, e) in sg {
                 if tx.send(find_lists(&mut mf, buf, n, fl, s, e)).is_err() {
                     return;
@@ -1379,11 +1416,7 @@ fn encode_sub_a<const A: usize>(buf: &[u8], n: usize, d0: usize, base: usize, x8
     let mut toks = Vec::with_capacity(WIN);
     let mut view = View::new(n, d0);
     m.flags = dense_segments(&buf[..n]);
-    for p in 0..d0 {
-        if !m.flags[p >> SEG_BITS] {
-            mf.insert(buf, n, p);
-        }
-    }
+    mf.insert_history(buf, n, d0, &m.flags);
     let mut pos = d0;
     while pos < n {
         let seg = pos >> SEG_BITS;
@@ -1520,7 +1553,7 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     let sub = if arr != 0 && !crate::sys::dev_flag("NZ_SUB") { sub_size(data.len(), threads, code).min(FAST_SUB) } else { sub_size(data.len(), threads, code) };
     let parts: Vec<(usize, &[u8])> =
         if data.is_empty() { vec![(0, data)] } else { data.chunks(sub).enumerate().map(|(i, c)| (i * sub, c)).collect() };
-    let coded = crate::par::map(&parts, threads, |&(base, p)| {
+    let code_part = |base: usize, p: &[u8], pre: Option<Lists>| -> Vec<u8> {
         let d0 = dict_len(base);
         let n = d0 + p.len();
         crate::par::with_memory(mem_for(n), || {
@@ -1529,11 +1562,11 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
             buf.extend_from_slice(&data[base - d0..base + p.len()]);
             buf.resize(n + NICE + 8, 0);
             let b0 = base - d0;
-            let c = if !crate::sys::dev_flag("NZ_NOMT") && p.len() >= 2 * PSEG {
+            let c = if pre.is_some() || (!crate::sys::dev_flag("NZ_NOMT") && p.len() >= 2 * PSEG) {
                 #[cfg(target_arch = "x86_64")]
-                let c = if crate::codec::has_avx2() { unsafe { encode_mt_avx2(&buf, n, d0, b0, x86ctx, threads, arr) } } else { encode_sub_mt(&buf, n, d0, b0, x86ctx, threads, arr) };
+                let c = if crate::codec::has_avx2() { unsafe { encode_mt_avx2(&buf, n, d0, b0, x86ctx, threads, arr, pre) } } else { encode_sub_mt(&buf, n, d0, b0, x86ctx, threads, arr, pre) };
                 #[cfg(not(target_arch = "x86_64"))]
-                let c = encode_sub_mt(&buf, n, d0, b0, x86ctx, threads, arr);
+                let c = encode_sub_mt(&buf, n, d0, b0, x86ctx, threads, arr, pre);
                 c
             } else {
                 encode_one(&buf, n, d0, b0, x86ctx, arr)
@@ -1541,7 +1574,26 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
             crate::progress::work(p.len());
             c
         })
-    });
+    };
+    // chunks of sub-blocks run at once; the GPU finds each chunk's match lists (with its
+    // history) in one job, and its sub-blocks take their part. Without a GPU every
+    // sub-block runs its own CPU match finder.
+    let groups: Vec<&[(usize, &[u8])]> = parts.chunks((GPU_CHUNK / sub).max(1)).collect();
+    let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |group| {
+        let c0 = group[0].0;
+        let c1 = group[group.len() - 1].0 + group[group.len() - 1].1.len();
+        let w0 = c0 - dict_len(c0);
+        let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || c1 - c0 < 2 * PSEG {
+            None
+        } else {
+            let skip: Vec<bool> = dense_segments(&data[w0..c1]).iter().enumerate().map(|(i, &f)| f || (i + 1) << SEG_BITS <= c0 - w0).collect();
+            crate::gpu::match_lists(&data[w0..c1], SEG_BITS, &skip).map(|(idx, m)| Lists { start: 0, idx, m })
+        };
+        crate::par::map(group, threads, |&(base, p)| code_part(base, p, lists.as_ref().map(|l| l.window(w0, base, dict_len(base), p.len()))))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     let mut out = Vec::with_capacity(coded.iter().map(|c| c.len()).sum::<usize>() + 8 * coded.len());
     crate::container::write_varint(&mut out, sub as u64);
     crate::container::write_varint(&mut out, coded.len() as u64);
@@ -1666,7 +1718,7 @@ mod perf {
 mod litperf {
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     unsafe fn enc(buf: &[u8]) -> Vec<u8> {
-        let mut lit = super::Lit::new();
+        let mut lit = super::Lit::new(false);
         let mut enc = crate::coder::Encoder::new(buf.len());
         for pos in 0..buf.len() {
             let prev = if pos > 0 { buf[pos - 1] as u32 } else { 0 };
@@ -1677,7 +1729,7 @@ mod litperf {
     }
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     unsafe fn dec(c: &[u8], n: usize) -> Vec<u8> {
-        let mut lit = super::Lit::new();
+        let mut lit = super::Lit::new(false);
         let mut dec = crate::coder::Decoder::new(c);
         let mut out = Vec::with_capacity(n);
         for pos in 0..n {

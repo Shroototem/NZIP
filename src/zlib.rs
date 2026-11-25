@@ -1302,4 +1302,22 @@ mod tests {
         let c = deflate(&[], 6, 8);
         assert_eq!(inflate(&c, 10).unwrap().0, Vec::<u8>::new());
     }
+
+    /// Deflate speed (and output fingerprints, which must not change) on a file:
+    /// `NZ_FILE=... cargo test --release deflate_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn deflate_timing() {
+        let data = std::fs::read(std::env::var("NZ_FILE").unwrap()).unwrap();
+        for (level, mem) in [(1, 8), (6, 8), (9, 8)] {
+            let t = std::time::Instant::now();
+            let c = deflate(&data, level, mem);
+            let s = t.elapsed().as_secs_f64();
+            let h = c.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+            let t = std::time::Instant::now();
+            assert!(deflate_eq(&data, level, mem, &c));
+            let se = t.elapsed().as_secs_f64();
+            eprintln!("level {level}: {} -> {} ({:016x}) deflate {:.1} MB/s, deflate_eq {:.1} MB/s", data.len(), c.len(), h, data.len() as f64 / 1e6 / s, data.len() as f64 / 1e6 / se);
+        }
+    }
 }
