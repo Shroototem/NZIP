@@ -27,8 +27,11 @@ __device__ __forceinline__ u32 match9(u32 d) { return __match_any_sync(0xfffffff
 #define RS_IPL 8
 #define RS_TILE (THREADS * RS_IPL)  // 2048 items per tile
 
-extern "C" __global__ void rs_hist(const u64* __restrict__ keys, u32 n, u32 shift,
-                                   u32* __restrict__ hist, u32 ntiles) {
+__device__ u32 block_scan(u32 v, int mx, u32* total);
+
+template <typename K>
+__device__ __forceinline__ void rs_hist_t(const K* __restrict__ keys, u32 n, u32 shift,
+                                          u32* __restrict__ hist, u32 ntiles) {
     __shared__ u32 h[256];
     h[threadIdx.x] = 0;
     __syncthreads();
@@ -41,19 +44,19 @@ extern "C" __global__ void rs_hist(const u64* __restrict__ keys, u32 n, u32 shif
     hist[threadIdx.x * ntiles + blockIdx.x] = h[threadIdx.x];
 }
 
-__device__ u32 block_scan(u32 v, int mx, u32* total);
 
 // Stable scatter. Items of a tile are ranked in index order (warp-major, then iteration,
 // then lane), staged in shared memory sorted by digit, then written out so that runs of
 // equal digits go to consecutive global addresses (coalesced).
 // hs = exclusive scan of the digit-major histogram.
-extern "C" __global__ void rs_scatter(const u64* __restrict__ kin, const u32* __restrict__ vin,
-                                      u64* __restrict__ kout, u32* __restrict__ vout, u32 n,
-                                      u32 shift, const u32* __restrict__ hs, u32 ntiles) {
+template <typename K>
+__device__ __forceinline__ void rs_scatter_t(const K* __restrict__ kin, const u32* __restrict__ vin,
+                                             K* __restrict__ kout, u32* __restrict__ vout, u32 n,
+                                             u32 shift, const u32* __restrict__ hs, u32 ntiles) {
     __shared__ u32 cnt[WARPS][256];
     __shared__ u32 goff[256];
     __shared__ u32 toff[256];
-    __shared__ u64 sk[RS_TILE];
+    __shared__ K sk[RS_TILE];
     __shared__ u32 sv[RS_TILE];
     u32 t = threadIdx.x, w = t >> 5, lane = t & 31;
     for (u32 i = t; i < WARPS * 256; i += THREADS) (&cnt[0][0])[i] = 0;
@@ -81,7 +84,7 @@ extern "C" __global__ void rs_scatter(const u64* __restrict__ kin, const u32* __
     u32 lt = lanemask_lt();
     for (int it = 0; it < RS_IPL; it++) {
         u32 i = base + it * 32 + lane;
-        u64 key = 0;
+        K key = 0;
         u32 val = 0, d = 256u;
         if (i < n) {
             key = kin[i];
@@ -102,12 +105,28 @@ extern "C" __global__ void rs_scatter(const u64* __restrict__ kin, const u32* __
     __syncthreads();
     u32 len = n - tile0 < RS_TILE ? n - tile0 : RS_TILE;
     for (u32 j = t; j < len; j += THREADS) {
-        u64 key = sk[j];
+        K key = sk[j];
         u32 d = (u32)(key >> shift) & 255u;
         u32 dst = goff[d] + (j - toff[d]);
         kout[dst] = key;
         vout[dst] = sv[j];
     }
+}
+
+// 64-bit keys (suffix sorting) and 32-bit keys (gram groups)
+extern "C" __global__ void rs_hist(const u64* __restrict__ keys, u32 n, u32 shift, u32* __restrict__ hist, u32 ntiles) {
+    rs_hist_t<u64>(keys, n, shift, hist, ntiles);
+}
+extern "C" __global__ void rs_hist32(const u32* __restrict__ keys, u32 n, u32 shift, u32* __restrict__ hist, u32 ntiles) {
+    rs_hist_t<u32>(keys, n, shift, hist, ntiles);
+}
+extern "C" __global__ void rs_scatter(const u64* __restrict__ kin, const u32* __restrict__ vin, u64* __restrict__ kout,
+                                      u32* __restrict__ vout, u32 n, u32 shift, const u32* __restrict__ hs, u32 ntiles) {
+    rs_scatter_t<u64>(kin, vin, kout, vout, n, shift, hs, ntiles);
+}
+extern "C" __global__ void rs_scatter32(const u32* __restrict__ kin, const u32* __restrict__ vin, u32* __restrict__ kout,
+                                        u32* __restrict__ vout, u32 n, u32 shift, const u32* __restrict__ hs, u32 ntiles) {
+    rs_scatter_t<u32>(kin, vin, kout, vout, n, shift, hs, ntiles);
 }
 
 // ------------------------------------------------------------------ scans (sum or max)
@@ -405,28 +424,26 @@ extern "C" __global__ void mf_lcp(const unsigned char* __restrict__ s, const u32
 #define MF_LEVELS 6
 __device__ __constant__ u32 MF_GRAM[MF_LEVELS] = {3, 4, 6, 8, 12, 16};
 
-// Key of the gram of length L at p (exact up to 8 bytes, hashed above); positions too close
-// to the end get a key of their own so they match nothing.
-extern "C" __global__ void mf_keys(const unsigned char* __restrict__ s, u32 n, u32 L, u64* key, u32* val) {
+// Gram groups from the suffix array: suffixes sharing their first L bytes are adjacent,
+// and a group starts where the common prefix with the previous suffix is shorter than L.
+// g[r] = r at group starts, else 0 (a max-scan then gives each rank its group's start).
+extern "C" __global__ void mf_gstart(const unsigned short* __restrict__ lcp, u32 n, u32 L, u32* g) {
+    u32 r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    g[r] = (r == 0 || lcp[r] < L) ? r : 0;
+}
+
+// Sort input in text order: key = the gram group of position p, value = p.
+extern "C" __global__ void mf_gkeys(const u32* __restrict__ isa, const u32* __restrict__ g, u32 n, u32* key, u32* val) {
     u32 p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
-    // grams running past the end are zero-padded: false pairs are dropped by the length check
-    u64 k;
-    if (L <= 8) {
-        k = 0;
-        for (u32 j = 0; j < L; j++) k = (k << 8) | (p + j < n ? s[p + j] : 0);
-    } else {
-        u32 h = 2166136261u;
-        for (u32 j = 0; j < L; j++) h = (h ^ (p + j < n ? s[p + j] : 0)) * 16777619u;
-        k = h;
-    }
-    key[p] = k;
+    key[p] = g[isa[p]];
     val[p] = p;
 }
 
 // After a stable sort by key, each position's predecessor with the same key is its nearest
 // earlier occurrence of that gram.
-extern "C" __global__ void mf_prev(const u64* __restrict__ key, const u32* __restrict__ val, u32 n, u32* prev) {
+extern "C" __global__ void mf_prev(const u32* __restrict__ key, const u32* __restrict__ val, u32 n, u32* prev) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     prev[val[i]] = (i > 0 && key[i] == key[i - 1]) ? val[i - 1] : 0xFFFFFFFFu;
@@ -436,6 +453,36 @@ extern "C" __global__ void mf_prev(const u64* __restrict__ key, const u32* __res
 // suffix-array neighbours on each side. Output per position: count, then up to MF_C
 // (len, dist - 1) pairs with increasing length and increasing distance (each the nearest
 // occurrence for its length range).
+//
+// Candidates are taken longest first (ties: nearest) and kept when nearer than every
+// longer one. Both neighbour scans already come out longest first, so they are merged on
+// the fly with the (sorted) gram candidates: linear time, nothing stored per candidate.
+struct MfSide {
+    u32 i, m, len, d;
+    bool live;
+};
+
+__device__ __forceinline__ void mf_next(MfSide& c, const u32* __restrict__ sa, const unsigned short* __restrict__ lcp,
+                                        u32 r, u32 n, u32 p, int dir) {
+    while (c.live) {
+        if (c.i > MF_K) { c.live = false; break; }
+        u32 l, q;
+        if (dir < 0) {
+            if (c.i > r) { c.live = false; break; }
+            l = lcp[r - c.i + 1];
+            q = sa[r - c.i];
+        } else {
+            if (r + c.i >= n) { c.live = false; break; }
+            l = lcp[r + c.i];
+            q = sa[r + c.i];
+        }
+        if (l < c.m) c.m = l;
+        if (c.m < 3) { c.live = false; break; }
+        c.i++;
+        if (q < p) { c.len = c.m; c.d = p - q - 1; return; }
+    }
+}
+
 extern "C" __global__ void mf_find(const unsigned char* __restrict__ s, const u32* __restrict__ sa,
                                    const u32* __restrict__ isa, const unsigned short* __restrict__ lcp,
                                    const u32* __restrict__ prev, u32 n, u32 p0, u32 cnt, u32* out) {
@@ -443,66 +490,62 @@ extern "C" __global__ void mf_find(const unsigned char* __restrict__ s, const u3
     if (t >= cnt) return;
     u32 p = p0 + t;
     u32 r = isa[p];
-    u32 cl[2 * MF_K + MF_LEVELS], cd[2 * MF_K + MF_LEVELS];
-    u32 nc = 0;
-    // nearest earlier occurrence of each gram length
+    // nearest earlier occurrence of each gram length, sorted longest first (ties: nearest)
     u32 room = n - p;
     if (room > MF_MAXL) room = MF_MAXL;
+    u32 gl[MF_LEVELS], gd[MF_LEVELS];
+    u32 ng = 0;
     for (u32 v = 0; v < MF_LEVELS; v++) {
         u32 q = prev[(u64)v * n + p];
         if (q == 0xFFFFFFFFu) continue;
         u32 l = 0;
         while (l < room && s[q + l] == s[p + l]) l++;
-        if (l >= 3) { cl[nc] = l; cd[nc] = p - q - 1; nc++; }
-    }
-    u32 m = MF_MAXL;
-    for (u32 i = 1; i <= MF_K && i <= r; i++) {
-        u32 l = lcp[r - i + 1];
-        if (l < m) m = l;
-        if (m < 3) break;
-        u32 q = sa[r - i];
-        if (q < p) { cl[nc] = m; cd[nc] = p - q - 1; nc++; }
-    }
-    m = MF_MAXL;
-    for (u32 i = 1; i <= MF_K && r + i < n; i++) {
-        u32 l = lcp[r + i];
-        if (l < m) m = l;
-        if (m < 3) break;
-        u32 q = sa[r + i];
-        if (q < p) { cl[nc] = m; cd[nc] = p - q - 1; nc++; }
-    }
-    // Pareto front: keep (len, dist) unless some candidate is at least as long and nearer.
-    // Selection by repeatedly taking the longest remaining (ties: nearest).
-    u32* o = out + (u64)t * (1 + 2 * MF_C);
-    u32 kl[2 * MF_K + MF_LEVELS], kd[2 * MF_K + MF_LEVELS];
-    u32 nk = 0;
-    u32 best_d = 0xffffffffu;
-    for (u32 it = 0; it < nc; it++) {
-        u32 bi = 0xffffffffu;
-        for (u32 j = 0; j < nc; j++) {
-            if (cl[j] == 0) continue;
-            if (bi == 0xffffffffu || cl[j] > cl[bi] || (cl[j] == cl[bi] && cd[j] < cd[bi])) bi = j;
+        if (l < 3) continue;
+        u32 d = p - q - 1, k = ng++;
+        while (k > 0 && (gl[k - 1] < l || (gl[k - 1] == l && gd[k - 1] > d))) {
+            gl[k] = gl[k - 1];
+            gd[k] = gd[k - 1];
+            k--;
         }
-        if (bi == 0xffffffffu) break;
-        if (cd[bi] < best_d) {
-            best_d = cd[bi];
-            kl[nk] = cl[bi];
-            kd[nk] = cd[bi];
+        gl[k] = l;
+        gd[k] = d;
+    }
+    MfSide a = {1, MF_MAXL, 0, 0, true}, b = {1, MF_MAXL, 0, 0, true};
+    mf_next(a, sa, lcp, r, n, p, -1);
+    mf_next(b, sa, lcp, r, n, p, 1);
+    u32 gi = 0;
+    // kept pairs: the first MF_C (longest) and the last one (nearest)
+    u32 kl[MF_C], kd[MF_C], ll = 0, ld = 0, nk = 0;
+    u32 best_d = 0xffffffffu;
+    while (true) {
+        u32 lm = 0;
+        if (a.live && a.len > lm) lm = a.len;
+        if (b.live && b.len > lm) lm = b.len;
+        if (gi < ng && gl[gi] > lm) lm = gl[gi];
+        if (lm == 0) break;
+        u32 dm = 0xffffffffu;
+        while (a.live && a.len == lm) { if (a.d < dm) dm = a.d; mf_next(a, sa, lcp, r, n, p, -1); }
+        while (b.live && b.len == lm) { if (b.d < dm) dm = b.d; mf_next(b, sa, lcp, r, n, p, 1); }
+        while (gi < ng && gl[gi] == lm) { if (gd[gi] < dm) dm = gd[gi]; gi++; }
+        if (dm < best_d) {
+            best_d = dm;
+            if (nk < MF_C) { kl[nk] = lm; kd[nk] = dm; }
+            ll = lm;
+            ld = dm;
             nk++;
         }
-        cl[bi] = 0;
     }
     // kl is decreasing; emit increasing, keeping the nearest and the MF_C - 1 longest
+    u32* o = out + (u64)t * (1 + 2 * MF_C);
     u32 e = 0;
     if (nk > MF_C) {
-        o[1 + 2 * e] = kl[nk - 1];
-        o[2 + 2 * e] = kd[nk - 1];
-        e++;
-        for (u32 j = MF_C - 2; j < MF_C - 1; j--) {
+        o[1] = ll;
+        o[2] = ld;
+        e = 1;
+        for (int j = MF_C - 2; j >= 0; j--) {
             o[1 + 2 * e] = kl[j];
             o[2 + 2 * e] = kd[j];
             e++;
-            if (j == 0) break;
         }
     } else {
         for (u32 j = nk; j > 0; j--) {
@@ -516,11 +559,13 @@ extern "C" __global__ void mf_find(const unsigned char* __restrict__ s, const u3
 
 // Number of pairs each position keeps (0 inside skipped segments).
 extern "C" __global__ void mf_count(const u32* __restrict__ out, const unsigned char* __restrict__ skip,
-                                    u32 seg_bits, u32 p0, u32 cnt, u32* counts) {
+                                    u32 seg_bits, u32 p0, u32 cnt, u32* counts, unsigned char* c8) {
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= cnt) return;
     u32 c = out[(u64)t * (1 + 2 * MF_C)];
-    counts[t] = skip[(p0 + t) >> seg_bits] ? 0u : (c < MF_C ? c : MF_C);
+    c = skip[(p0 + t) >> seg_bits] ? 0u : (c < MF_C ? c : MF_C);
+    counts[t] = c;
+    c8[t] = (unsigned char)c;
 }
 
 // Packs the kept pairs contiguously (offs = exclusive scan of counts).

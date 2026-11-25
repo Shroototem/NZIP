@@ -105,6 +105,8 @@ unsafe fn sym(lib: *mut c_void, name: &str) -> *mut c_void {
 struct Kernels {
     rs_hist: *mut c_void,
     rs_scatter: *mut c_void,
+    rs_hist32: *mut c_void,
+    rs_scatter32: *mut c_void,
     scan_reduce: *mut c_void,
     scan_top: *mut c_void,
     scan_down: *mut c_void,
@@ -122,7 +124,8 @@ struct Kernels {
     ub_c1: *mut c_void,
     mf_lcp: *mut c_void,
     mf_find: *mut c_void,
-    mf_keys: *mut c_void,
+    mf_gstart: *mut c_void,
+    mf_gkeys: *mut c_void,
     mf_prev: *mut c_void,
     mf_count: *mut c_void,
     mf_pack: *mut c_void,
@@ -215,6 +218,8 @@ unsafe fn init() -> Result<Gpu, String> {
         let k = Kernels {
             rs_hist: f("rs_hist")?,
             rs_scatter: f("rs_scatter")?,
+            rs_hist32: f("rs_hist32")?,
+            rs_scatter32: f("rs_scatter32")?,
             scan_reduce: f("scan_reduce")?,
             scan_top: f("scan_top")?,
             scan_down: f("scan_down")?,
@@ -232,7 +237,8 @@ unsafe fn init() -> Result<Gpu, String> {
             ub_c1: f("ub_c1")?,
             mf_lcp: f("mf_lcp")?,
             mf_find: f("mf_find")?,
-            mf_keys: f("mf_keys")?,
+            mf_gstart: f("mf_gstart")?,
+            mf_gkeys: f("mf_gkeys")?,
             mf_prev: f("mf_prev")?,
             mf_count: f("mf_count")?,
             mf_pack: f("mf_pack")?,
@@ -370,19 +376,30 @@ impl Gpu {
         )
     }
 
-    /// Stable LSD radix sort of (key, val) pairs by the given 8-bit digit shifts.
-    /// Returns true if the result ended up in the alternate buffers.
+    /// Stable LSD radix sort of (key, val) pairs (64-bit keys) by the given 8-bit digit
+    /// shifts. Returns true if the result ended up in the alternate buffers.
     #[allow(clippy::too_many_arguments)]
     fn sort(&self, k0: DevPtr, v0: DevPtr, k1: DevPtr, v1: DevPtr, n: u32, shifts: &[u32], hist: DevPtr, sums: DevPtr) -> Result<bool, String> {
+        self.sort_with(self.k.rs_hist, self.k.rs_scatter, k0, v0, k1, v1, n, shifts, hist, sums)
+    }
+
+    /// `sort` for 32-bit keys.
+    #[allow(clippy::too_many_arguments)]
+    fn sort32(&self, k0: DevPtr, v0: DevPtr, k1: DevPtr, v1: DevPtr, n: u32, shifts: &[u32], hist: DevPtr, sums: DevPtr) -> Result<bool, String> {
+        self.sort_with(self.k.rs_hist32, self.k.rs_scatter32, k0, v0, k1, v1, n, shifts, hist, sums)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sort_with(&self, hk: *mut c_void, sk: *mut c_void, k0: DevPtr, v0: DevPtr, k1: DevPtr, v1: DevPtr, n: u32, shifts: &[u32], hist: DevPtr, sums: DevPtr) -> Result<bool, String> {
         let tiles = n.div_ceil(RS_TILE);
         let (mut ki, mut vi, mut ko, mut vo) = (k0, v0, k1, v1);
         let mut flipped = false;
         for &sh in shifts {
             let (mut n_, mut sh_, mut h, mut t) = (n, sh, hist, tiles);
-            self.launch_grid(self.k.rs_hist, tiles, 256, &mut [arg(&mut ki), arg(&mut n_), arg(&mut sh_), arg(&mut h), arg(&mut t)])?;
+            self.launch_grid(hk, tiles, 256, &mut [arg(&mut ki), arg(&mut n_), arg(&mut sh_), arg(&mut h), arg(&mut t)])?;
             self.scan(hist, tiles * 256, sums, false, false)?;
             self.launch_grid(
-                self.k.rs_scatter,
+                sk,
                 tiles,
                 256,
                 &mut [arg(&mut ki), arg(&mut vi), arg(&mut ko), arg(&mut vo), arg(&mut n_), arg(&mut sh_), arg(&mut h), arg(&mut t)],
@@ -526,25 +543,32 @@ impl Gpu {
         let d = self.sa_build(s)?;
         lap("suffix array");
         let (mut tp, mut np, mut sap, mut isap) = (d.text.p, n32, d.sa.p, d.rank.p);
-        // nearest earlier occurrence per gram length: stable sort (key = gram, value = position)
+        let lcp = self.alloc(n * 2 + 16)?;
+        let mut lcpp = lcp.p;
+        self.launch(self.k.mf_lcp, n32, 256, &mut [arg(&mut tp), arg(&mut sap), arg(&mut np), arg(&mut lcpp)])?;
+        lap("lcp");
+        // nearest earlier occurrence per gram length: suffixes sharing their first L bytes
+        // form a group of ranks; a stable sort of positions by group (key = group start,
+        // value = position) puts each one right after its nearest earlier occurrence
         const LEVELS: usize = 6;
         const GRAMS: [u32; LEVELS] = [3, 4, 6, 8, 12, 16];
         let prev = self.alloc(n * 4 * LEVELS)?;
+        let g = self.alloc(n * 4)?;
+        let bits = 32 - (n32.max(2) - 1).leading_zeros();
+        let shifts: Vec<u32> = (0..bits.div_ceil(8)).map(|i| i * 8).collect();
         for (v, &l) in GRAMS.iter().enumerate() {
-            // key bytes: the gram itself up to 8 bytes, else a 32-bit hash
-            let shifts: Vec<u32> = (0..if l <= 8 { l } else { 4 }).map(|i| i * 8).collect();
-            let (mut kp, mut vp, mut l_) = (d.ka.p, d.va.p, l);
-            self.launch(self.k.mf_keys, n32, 256, &mut [arg(&mut tp), arg(&mut np), arg(&mut l_), arg(&mut kp), arg(&mut vp)])?;
-            let flipped = self.sort(d.ka.p, d.va.p, d.kb.p, d.vb.p, n32, &shifts, d.hist.p, d.sums.p)?;
+            let (mut lp, mut gp, mut l_) = (lcp.p, g.p, l);
+            self.launch(self.k.mf_gstart, n32, 256, &mut [arg(&mut lp), arg(&mut np), arg(&mut l_), arg(&mut gp)])?;
+            self.scan(g.p, n32, d.sums.p, true, true)?;
+            let (mut kp, mut vp) = (d.ka.p, d.va.p);
+            self.launch(self.k.mf_gkeys, n32, 256, &mut [arg(&mut isap), arg(&mut gp), arg(&mut np), arg(&mut kp), arg(&mut vp)])?;
+            let flipped = self.sort32(d.ka.p, d.va.p, d.kb.p, d.vb.p, n32, &shifts, d.hist.p, d.sums.p)?;
             let (mut ks, mut vs) = if flipped { (d.kb.p, d.vb.p) } else { (d.ka.p, d.va.p) };
             let mut pp = prev.p + (v * n * 4) as u64;
             self.launch(self.k.mf_prev, n32, 256, &mut [arg(&mut ks), arg(&mut vs), arg(&mut np), arg(&mut pp)])?;
         }
         lap("gram levels");
         let mut prevp = prev.p;
-        let mut lcpp = d.kb.p;
-        self.launch(self.k.mf_lcp, n32, 256, &mut [arg(&mut tp), arg(&mut sap), arg(&mut np), arg(&mut lcpp)])?;
-        lap("lcp");
         unsafe { ck((self.api.cuCtxSynchronize)(), "sync")? };
         let e = self.read_u32(d.err.p)?;
         if e != 0 {
@@ -556,11 +580,12 @@ impl Gpu {
         let skipd = self.alloc(skip.len())?;
         let flags: Vec<u8> = skip.iter().map(|&b| b as u8).collect();
         let counts = self.alloc(chunk * 4)?;
+        let c8 = self.alloc(chunk)?;
         let packed = self.alloc(chunk * C * 8)?;
         unsafe { ck((self.api.cuMemcpyHtoD_v2)(skipd.p, flags.as_ptr() as *const c_void, flags.len()), "upload")? };
         let mut idx = Vec::with_capacity(n + 1);
         let mut m: Vec<(u32, u32)> = Vec::with_capacity(n * 2);
-        let mut offs = vec![0u32; chunk];
+        let mut cnts = vec![0u8; chunk];
         let mut p0 = 0usize;
         while p0 < n {
             let cnt = chunk.min(n - p0);
@@ -571,8 +596,8 @@ impl Gpu {
                 128,
                 &mut [arg(&mut tp), arg(&mut sap), arg(&mut isap), arg(&mut lcpp), arg(&mut prevp), arg(&mut np), arg(&mut p0_), arg(&mut cnt_), arg(&mut outp)],
             )?;
-            let (mut sk, mut sb, mut cp) = (skipd.p, seg_bits, counts.p);
-            self.launch(self.k.mf_count, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut sk), arg(&mut sb), arg(&mut p0_), arg(&mut cnt_), arg(&mut cp)])?;
+            let (mut sk, mut sb, mut cp, mut c8p) = (skipd.p, seg_bits, counts.p, c8.p);
+            self.launch(self.k.mf_count, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut sk), arg(&mut sb), arg(&mut p0_), arg(&mut cnt_), arg(&mut cp), arg(&mut c8p)])?;
             let last = self.read_u32(counts.p + (cnt as u64 - 1) * 4)?;
             // exclusive scan in place: counts -> offsets (then counts are re-read for the pack)
             let offsd = self.alloc(cnt * 4)?;
@@ -582,13 +607,21 @@ impl Gpu {
             let (mut op, mut pk) = (offsd.p, packed.p);
             self.launch(self.k.mf_pack, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut op), arg(&mut cp), arg(&mut cnt_), arg(&mut pk)])?;
             lap("find");
-            let base = m.len() as u32;
-            m.resize(m.len() + total, (0, 0));
+            // counts come back as bytes (offsets are rebuilt here), the pairs straight into
+            // the list's spare capacity
+            let base = m.len();
+            m.reserve(total);
             unsafe {
-                ck((self.api.cuMemcpyDtoH_v2)(offs.as_mut_ptr() as *mut c_void, offsd.p, cnt * 4), "download")?;
-                ck((self.api.cuMemcpyDtoH_v2)(m[base as usize..].as_mut_ptr() as *mut c_void, packed.p, total * 8), "download")?;
+                ck((self.api.cuMemcpyDtoH_v2)(cnts.as_mut_ptr() as *mut c_void, c8.p, cnt), "download")?;
+                ck((self.api.cuMemcpyDtoH_v2)(m.as_mut_ptr().add(base) as *mut c_void, packed.p, total * 8), "download")?;
+                m.set_len(base + total);
             }
-            idx.extend(offs[..cnt].iter().map(|&o| base + o));
+            let mut at = base as u32;
+            idx.extend(cnts[..cnt].iter().map(|&c| {
+                let o = at;
+                at += c as u32;
+                o
+            }));
             p0 += cnt;
             lap("download");
         }
