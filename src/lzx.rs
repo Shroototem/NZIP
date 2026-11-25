@@ -12,7 +12,7 @@
 //!
 //! Prices only steer the encoder's choices; the decoder never computes them.
 
-use crate::cm::{G, MixV, NG, hg};
+use crate::cm::{G, NG, hg};
 use crate::coder::{BitIo, Decoder, Encoder};
 
 /// Largest independent sub-block (sub-blocks run in parallel in both directions).
@@ -81,7 +81,7 @@ fn effort(arr: usize) -> usize {
 }
 
 fn arrivals() -> usize {
-    match std::env::var("NZ_ARR").ok().and_then(|v| v.parse::<usize>().ok()) {
+    match crate::sys::dev_var("NZ_ARR").and_then(|v| v.parse::<usize>().ok()) {
         Some(a) => a,
         None => ARRIVALS.load(std::sync::atomic::Ordering::Relaxed),
     }
@@ -91,7 +91,7 @@ fn arrivals() -> usize {
 /// two for machine code (it reuses distant history, so bigger sub-blocks pay off more);
 /// 256 KiB - 64 MiB. Dev override: NZ_SUB in MiB.
 fn sub_size(n: usize, threads: usize, code: bool) -> usize {
-    if let Some(v) = std::env::var("NZ_SUB").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(v) = crate::sys::dev_var("NZ_SUB").and_then(|v| v.parse::<usize>().ok()) {
         return (v << 20).clamp(1 << 20, SUB_BLOCK);
     }
     let share = match SHARE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -111,8 +111,6 @@ const H3_BITS: u32 = 16;
 const DEPTH: usize = 48;
 const NICE: usize = 64;
 const STATES: usize = 12;
-/// Parser prices literals with the full model (else order-1 counters only).
-const FULL_PRICE: bool = true;
 /// Parser also tries match/rep + literal + rep0 (LZMA's lookahead).
 const LOOKAHEAD: bool = true;
 
@@ -285,7 +283,6 @@ impl DistCoder {
         if s < 4 {
             return s;
         }
-        io.cat(7);
         let footer = (s >> 1) - 1;
         let base = (2 | (s & 1)) << footer;
         let r = d.wrapping_sub(base);
@@ -300,53 +297,23 @@ impl DistCoder {
 
 // ---------------------------------------------------------------- literal model
 
-/// Hint the CPU to start loading `p` (no effect on results).
-#[inline(always)]
-fn prefetch<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0)
-    }
-}
-
-#[inline(always)]
-fn ctx_hashes(ctx2: usize) -> u32 {
-    (ctx2 & 0xFFFF) as u32 * NG as u32
-}
-
+/// Literal model: two counters per bit, a fast one and a slow twin (rates LRATE and
+/// LRATE + 2), averaged. Their context is the match byte for the literal right after a
+/// match, the operand context inside the rel32 target of an x86 branch, else the previous
+/// byte; the second nibble's counters are also keyed by the first nibble.
 #[derive(Clone)]
 struct Lit {
     t1: Vec<G>,
-    t2: Vec<G>,
-    tm: Vec<G>,
-    tp: Vec<G>,
-    tx: Vec<G>,
-    /// recent average magnitude (low 7 bits): numeric tables, quantized weights
-    tg: Vec<G>,
-    avg: i32,
-    m: MixV<8>,
-    /// LZMA-style literal probabilities: per context, 0x300 (plain tree + matched trees)
-    lz: Vec<crate::cm::Ctr>,
-    /// slow-rate twins of t1/tm/tx (LIGHT = 5), or t1 widened by 2 bits of the byte two
-    /// back (LIGHT = 6)
     s1: Vec<G>,
+    tm: Vec<G>,
     sm: Vec<G>,
+    tx: Vec<G>,
     sx: Vec<G>,
 }
 
-const T2_BITS: u32 = 16;
-/// Literal model: 0 = context mixing, 1 = one counter per bit, 2 = two averaged.
-const LIGHT: u8 = 5;
-/// LZMA-style literal context bits (high bits of the previous byte), for LIGHT = 4.
-const LC: u32 = 3;
-/// Counter rate (shift) for the light literal models.
+/// Counter rate (shift) of the fast counters.
 const LRATE: u32 = 4;
 const TX_BITS: u32 = 18;
-
-#[inline(always)]
-fn upd(c: &mut crate::cm::Ctr, b: u32) {
-    c.update(b, 4)
-}
 
 /// If `pos` is inside the rel32 operand of an x86 CALL/JMP/Jcc, returns (operand byte
 /// index 1..=4, context): the filtered operand is a big-endian absolute target, so its
@@ -377,211 +344,69 @@ impl Lit {
     fn new() -> Lit {
         Lit {
             t1: vec![G::INIT; 256 * NG],
-            t2: vec![G::INIT; 1 << T2_BITS],
+            s1: vec![G::INIT; 256 * NG],
             tm: vec![G::INIT; 256 * NG],
-            tp: vec![G::INIT; 16 * NG],
+            sm: vec![G::INIT; 256 * NG],
             tx: vec![G::INIT; 1 << TX_BITS],
-            tg: vec![G::INIT; 64 * NG],
-            avg: 0,
-            m: MixV::new(256 * 2 * 5, 4, 6),
-            lz: vec![crate::cm::Ctr::INIT; if LIGHT == 4 { 0x300 << LC } else { 1 }],
-            s1: vec![G::INIT; if LIGHT == 5 { 256 * NG } else if LIGHT == 6 { 1024 * NG } else { 1 }],
-            sm: vec![G::INIT; if LIGHT == 5 { 256 * NG } else { 1 }],
-            sx: vec![G::INIT; if LIGHT == 5 { 1 << TX_BITS } else { 1 }],
+            sx: vec![G::INIT; 1 << TX_BITS],
         }
     }
 
-    /// `ctx2` = the two previous bytes.
+    /// Index of the counter groups for nibble selector `sel`, and which pair of tables
+    /// holds them (0 = previous byte, 1 = match byte, 2 = x86 operand).
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn code<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, ctx2: usize, mb: u32, pos: usize, matched: bool, op: (usize, u32)) -> u32 {
-        if LIGHT != 0 {
-            return self.code_light(io, byte, prev, ctx2, mb, matched, op);
+    fn slot(sel: usize, prev: u32, mb: u32, matched: bool, xc: Option<u32>) -> (u8, usize) {
+        match xc {
+            _ if matched => (1, mb as usize * NG + sel),
+            Some(x) => (2, hg(x + sel as u32, TX_BITS)),
+            None => (0, prev as usize * NG + sel),
         }
-        let Lit { t1, t2, tm, tp, tx, tg, avg, m, .. } = self;
+    }
+
+    #[inline(always)]
+    fn pair(&self, t: u8, i: usize) -> (&G, &G) {
+        match t {
+            1 => (&self.tm[i], &self.sm[i]),
+            2 => (&self.tx[i], &self.sx[i]),
+            _ => (&self.t1[i], &self.s1[i]),
+        }
+    }
+
+    #[inline(always)]
+    fn pair_mut(&mut self, t: u8, i: usize) -> (&mut G, &mut G) {
+        match t {
+            1 => (&mut self.tm[i], &mut self.sm[i]),
+            2 => (&mut self.tx[i], &mut self.sx[i]),
+            _ => (&mut self.t1[i], &mut self.s1[i]),
+        }
+    }
+
+    /// Hash seed of the x86 operand context (None outside branch targets).
+    #[inline(always)]
+    fn xc(op: (usize, u32)) -> Option<u32> {
         let (k, octx) = op;
-        let row = ((matched as usize) << 8) | (k << 9);
-        let mag = ((*avg >> 2).min(63)) as usize;
-        let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-        let c2 = ctx_hashes(ctx2);
-        let t2p = t2.as_ptr();
-        let mut c0 = 1usize;
-        for half in 0..2 {
-            // second nibble: one group per value of the first
-            let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-            let g1 = &mut t1[prev as usize * NG + sel].0;
-            let g2 = &mut t2[hg(c2 + sel as u32, T2_BITS)].0;
-            let gm = &mut tm[mb as usize * NG + sel].0;
-            let gp = &mut tp[(pos & 15) * NG + sel].0;
-            // fifth input: the x86 operand context inside a branch target, else magnitude
-            let g5 = if k != 0 { &mut tx[hg(xc + sel as u32, TX_BITS)].0 } else { &mut tg[mag * NG + sel].0 };
-            let mut j = 1usize;
-            for q in 0..4 {
-                let i = 7 - (half * 4 + q);
-                let x = [g1[j].st(), g2[j].st(), gm[j].st(), gp[j].st(), g5[j].st(), 0, 256, 0];
-                let pa = m.predict12(x, c0 | row);
-                let p = ((pa << 4) as u32).clamp(48, 65535 - 48);
-                let b = io.code((byte >> i) & 1, p);
-                m.update(b);
-                upd(&mut g1[j], b);
-                upd(&mut g2[j], b);
-                upd(&mut gm[j], b);
-                upd(&mut gp[j], b);
-                upd(&mut g5[j], b);
-                j = (j << 1) | b as usize;
-                c0 = (c0 << 1) | b as usize;
-                if half == 0 && q == 1 {
-                    // two bits of the first nibble known: 4 candidate groups for the second
-                    let base = 1 + ((c0 & 3) << 2) as u32;
-                    for v in 0..4 {
-                        prefetch(t2p.wrapping_add(hg(c2 + base + v, T2_BITS)));
-                    }
-                }
-            }
-        }
-        let v = (c0 & 255) as i32;
-        *avg += (((v & 0x7F) << 4) - *avg) >> 4;
-        v as u32
-    }
-
-    /// Starts loading the first-nibble groups of the big tables for a literal at `ctx2`.
-    #[inline(always)]
-    fn prefetch(&self, ctx2: usize) {
-        let c2 = ctx_hashes(ctx2);
-        prefetch(self.t2.as_ptr().wrapping_add(hg(c2, T2_BITS)));
-    }
-
-    /// Cost (1/16 bit) of `byte` under the full model as it stands (no updates).
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn cost(&self, t: &[u32], byte: u32, prev: u32, ctx2: usize, mb: u32, pos: usize, matched: bool, op: (usize, u32)) -> u32 {
-        if LIGHT != 0 {
-            return self.cost_light(t, byte, prev, ctx2, mb, matched, op);
-        }
-        let (k, octx) = op;
-        let row = ((matched as usize) << 8) | (k << 9);
-        let mag = ((self.avg >> 2).min(63)) as usize;
-        let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-        let c2 = ctx_hashes(ctx2);
-        let mut c0 = 1usize;
-        let mut s = 0;
-        for half in 0..2 {
-            let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-            let g1 = &self.t1[prev as usize * NG + sel].0;
-            let g2 = &self.t2[hg(c2 + sel as u32, T2_BITS)].0;
-            let gm = &self.tm[mb as usize * NG + sel].0;
-            let gp = &self.tp[(pos & 15) * NG + sel].0;
-            let g5 = if k != 0 { &self.tx[hg(xc + sel as u32, TX_BITS)].0 } else { &self.tg[mag * NG + sel].0 };
-            let mut j = 1usize;
-            for q in 0..4 {
-                let b = (byte >> (7 - (half * 4 + q))) & 1;
-                let x = [g1[j].st(), g2[j].st(), gm[j].st(), gp[j].st(), g5[j].st(), 0, 256, 0];
-                let pa = self.m.peek12(&x, c0 | row);
-                let p1 = pa.clamp(1, 4095) as u32;
-                s += t[(if b == 1 { p1 } else { 4096 - p1 }) as usize];
-                j = (j << 1) | b as usize;
-                c0 = (c0 << 1) | b as usize;
-            }
-        }
-        s
-    }
-
-    /// Groups used by LIGHT 5 (fast table, slow twin) and 6 (one group).
-    #[inline(always)]
-    fn light56(&self, sel: usize, prev: u32, c2: u32, mb: u32, matched: bool, xc: u32, k: usize) -> (&G, &G) {
-        if matched {
-            let i = mb as usize * NG + sel;
-            (&self.tm[i], if LIGHT == 5 { &self.sm[i] } else { &self.tm[i] })
-        } else if k != 0 {
-            let i = hg(xc + sel as u32, TX_BITS);
-            (&self.tx[i], if LIGHT == 5 { &self.sx[i] } else { &self.tx[i] })
-        } else if LIGHT == 5 {
-            let i = prev as usize * NG + sel;
-            (&self.t1[i], &self.s1[i])
-        } else {
-            let i = ((((c2 / NG as u32) >> 14) as usize & 3) << 8 | prev as usize) * NG + sel;
-            (&self.s1[i], &self.s1[i])
-        }
-    }
-
-    /// Light literal model (no mixer): one or two counters per bit, chosen by context.
-    #[inline(always)]
-    fn light_p(&self, sel: usize, j: usize, prev: u32, c2: u32, mb: u32, matched: bool, xc: u32, k: usize) -> u32 {
-        if LIGHT == 5 || LIGHT == 6 {
-            let (a, b) = self.light56(sel, prev, c2, mb, matched, xc, k);
-            let p = if LIGHT == 5 { (a.0[j].p() + b.0[j].p()) >> 1 } else { a.0[j].p() };
-            return p.clamp(48, 65535 - 48);
-        }
-        let g1 = self.t1[prev as usize * NG + sel].0[j].p();
-        let a = if matched {
-            self.tm[mb as usize * NG + sel].0[j].p()
-        } else if k != 0 {
-            self.tx[hg(xc + sel as u32, TX_BITS)].0[j].p()
-        } else {
-            g1
-        };
-        let b = if matched || k != 0 { g1 } else { self.t2[hg(c2 + sel as u32, T2_BITS)].0[j].p() };
-        let p = match LIGHT {
-            1 => a,
-            3 => {
-                let st = |v: u32| crate::tables::stretch((v >> 4) as i32);
-                let a = if matched || k != 0 { a } else { g1 };
-                (crate::tables::squash((st(a) + st(b)) >> 1) << 4) as u32
-            }
-            _ => (if matched || k != 0 { a } else { g1 } + b) >> 1,
-        };
-        p.clamp(48, 65535 - 48)
+        (k != 0).then(|| (((k as u32) << 16) | octx).wrapping_mul(NG as u32))
     }
 
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn code_light<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, ctx2: usize, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
-        if LIGHT == 4 {
-            return self.code_lzma(io, byte, prev, mb, matched, op);
-        }
-        let (k, octx) = op;
-        let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-        let c2 = ctx_hashes(ctx2);
+    fn p(a: &G, b: &G, j: usize) -> u32 {
+        ((a.0[j].p() + b.0[j].p()) >> 1).clamp(48, 65535 - 48)
+    }
+
+    /// Codes (or decodes, per `io`) one literal; `mb` = match byte, `op` = op_ctx.
+    #[inline(always)]
+    fn code<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+        let xc = Self::xc(op);
         let mut c0 = 1usize;
         for half in 0..2 {
             let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
+            let (t, i) = Self::slot(sel, prev, mb, matched, xc);
+            let (fa, sa) = self.pair_mut(t, i);
             let mut j = 1usize;
             for q in 0..4 {
-                let i = 7 - (half * 4 + q);
-                let p = self.light_p(sel, j, prev, c2, mb, matched, xc, k);
-                let b = io.code((byte >> i) & 1, p);
-                if LIGHT == 5 || LIGHT == 6 {
-                    let (fa, sa) = if matched {
-                        let i = mb as usize * NG + sel;
-                        (&mut self.tm[i] as *mut G, &mut self.sm[i] as *mut G)
-                    } else if k != 0 {
-                        let i = hg(xc + sel as u32, TX_BITS);
-                        (&mut self.tx[i] as *mut G, &mut self.sx[i] as *mut G)
-                    } else if LIGHT == 5 {
-                        let i = prev as usize * NG + sel;
-                        (&mut self.t1[i] as *mut G, &mut self.s1[i] as *mut G)
-                    } else {
-                        let i = ((((c2 / NG as u32) >> 14) as usize & 3) << 8 | prev as usize) * NG + sel;
-                        (&mut self.s1[i] as *mut G, std::ptr::null_mut())
-                    };
-                    unsafe {
-                        (*fa).0[j].update_young(b, LRATE);
-                        if LIGHT == 5 {
-                            (*sa).0[j].update_young(b, LRATE + 2);
-                        }
-                    }
-                    j = (j << 1) | b as usize;
-                    c0 = (c0 << 1) | b as usize;
-                    continue;
-                }
-                crate::cm::Ctr::update(&mut self.t1[prev as usize * NG + sel].0[j], b, LRATE);
-                if matched {
-                    crate::cm::Ctr::update(&mut self.tm[mb as usize * NG + sel].0[j], b, LRATE);
-                } else if k != 0 {
-                    crate::cm::Ctr::update(&mut self.tx[hg(xc + sel as u32, TX_BITS)].0[j], b, LRATE);
-                } else if LIGHT >= 2 {
-                    crate::cm::Ctr::update(&mut self.t2[hg(c2 + sel as u32, T2_BITS)].0[j], b, LRATE);
-                }
+                let b = io.code((byte >> (7 - (half * 4 + q))) & 1, Self::p(fa, sa, j));
+                fa.0[j].update_young(b, LRATE);
+                sa.0[j].update_young(b, LRATE + 2);
                 j = (j << 1) | b as usize;
                 c0 = (c0 << 1) | b as usize;
             }
@@ -589,134 +414,23 @@ impl Lit {
         (c0 & 255) as u32
     }
 
+    /// Cost (1/16 bit) of `byte` under the model as it stands (no updates).
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn cost_light(&self, t: &[u32], byte: u32, prev: u32, ctx2: usize, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
-        if LIGHT == 4 {
-            return self.cost_lzma(t, byte, prev, mb, matched, op);
-        }
-        let (k, octx) = op;
-        let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-        let c2 = ctx_hashes(ctx2);
+    fn cost(&self, t: &[u32], byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+        let xc = Self::xc(op);
         let mut c0 = 1usize;
         let mut s = 0;
         for half in 0..2 {
             let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
+            let (tb, i) = Self::slot(sel, prev, mb, matched, xc);
+            let (fa, sa) = self.pair(tb, i);
             let mut j = 1usize;
             for q in 0..4 {
                 let b = (byte >> (7 - (half * 4 + q))) & 1;
-                s += pr(t, Prob(self.light_p(sel, j, prev, c2, mb, matched, xc, k) as u16), b);
+                s += pr(t, Prob(Self::p(fa, sa, j) as u16), b);
                 j = (j << 1) | b as usize;
                 c0 = (c0 << 1) | b as usize;
             }
-        }
-        s
-    }
-
-    /// LZMA's literal coder: a bit tree per context; after a match the match byte's bits
-    /// select a second set of trees until the first bit that differs. x86 operand bytes
-    /// keep their own context.
-    #[inline(always)]
-    fn code_lzma<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
-        let (k, octx) = op;
-        if k != 0 {
-            let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-            let mut c0 = 1usize;
-            for half in 0..2 {
-                let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-                let mut j = 1usize;
-                for q in 0..4 {
-                    let i = 7 - (half * 4 + q);
-                    let g = &mut self.tx[hg(xc + sel as u32, TX_BITS)].0[j];
-                    let b = io.code((byte >> i) & 1, g.p().clamp(48, 65535 - 48));
-                    g.update(b, LRATE);
-                    j = (j << 1) | b as usize;
-                    c0 = (c0 << 1) | b as usize;
-                }
-            }
-            return (c0 & 255) as u32;
-        }
-        let base = ((prev >> (8 - LC)) as usize) * 0x300;
-        let probs = &mut self.lz[base..base + 0x300];
-        let mut sym = 1usize;
-        if matched {
-            let mut m = mb as usize;
-            let mut offs = 0x100usize;
-            while sym < 0x100 {
-                m <<= 1;
-                let mbit = m & offs;
-                let i = 7 - (sym.ilog2());
-                let g = &mut probs[offs + mbit + sym];
-                let b = io.code((byte >> i) & 1, g.p().clamp(48, 65535 - 48));
-                g.update(b, LRATE);
-                sym = (sym << 1) | b as usize;
-                offs &= if b == 1 { mbit } else { !mbit };
-            }
-        } else {
-            while sym < 0x100 {
-                let i = 7 - (sym.ilog2());
-                let g = &mut probs[sym];
-                let b = io.code((byte >> i) & 1, g.p().clamp(48, 65535 - 48));
-                g.update(b, LRATE);
-                sym = (sym << 1) | b as usize;
-            }
-        }
-        (sym & 255) as u32
-    }
-
-    #[inline(always)]
-    fn cost_lzma(&self, t: &[u32], byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
-        let (k, octx) = op;
-        let mut s = 0;
-        if k != 0 {
-            let xc = (((k as u32) << 16) | octx).wrapping_mul(NG as u32);
-            let mut c0 = 1usize;
-            for half in 0..2 {
-                let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
-                let mut j = 1usize;
-                for q in 0..4 {
-                    let b = (byte >> (7 - (half * 4 + q))) & 1;
-                    s += pr(t, Prob(self.tx[hg(xc + sel as u32, TX_BITS)].0[j].p().clamp(48, 65535 - 48) as u16), b);
-                    j = (j << 1) | b as usize;
-                    c0 = (c0 << 1) | b as usize;
-                }
-            }
-            return s;
-        }
-        let base = ((prev >> (8 - LC)) as usize) * 0x300;
-        let probs = &self.lz[base..base + 0x300];
-        let mut sym = 1usize;
-        let mut m = mb as usize;
-        let mut offs = if matched { 0x100usize } else { 0 };
-        while sym < 0x100 {
-            m <<= 1;
-            let mbit = m & offs;
-            let b = (byte >> (7 - sym.ilog2())) & 1;
-            s += pr(t, Prob(probs[offs + mbit + sym].p().clamp(48, 65535 - 48) as u16), b);
-            sym = (sym << 1) | b as usize;
-            offs &= if b == 1 { mbit } else { !mbit };
-        }
-        s
-    }
-
-    /// Approximate cost (1/16 bit) from the order-1 counters.
-    #[inline(always)]
-    fn price(&self, t: &[u32], byte: u32, prev: u32) -> u32 {
-        let mut s = 0;
-        let hi = (byte >> 4) as usize;
-        let g = &self.t1[prev as usize * NG].0;
-        let mut j = 1usize;
-        for i in (4..8).rev() {
-            let b = (byte >> i) & 1;
-            s += pr(t, Prob(g[j].p() as u16), b);
-            j = (j << 1) | b as usize;
-        }
-        let g = &self.t1[prev as usize * NG + 1 + hi].0;
-        let mut j = 1usize;
-        for i in (0..4).rev() {
-            let b = (byte >> i) & 1;
-            s += pr(t, Prob(g[j].p() as u16), b);
-            j = (j << 1) | b as usize;
         }
         s
     }
@@ -850,14 +564,6 @@ struct Model {
     is_dense: [Prob; 2],
 }
 
-#[inline(always)]
-fn h2_of(buf: &[u8], pos: usize) -> usize {
-    let c = if pos >= 3 { buf[pos - 3] as usize } else { 0 };
-    let a = if pos >= 2 { buf[pos - 2] as usize } else { 0 };
-    let b = if pos >= 1 { buf[pos - 1] as usize } else { 0 };
-    (c << 16) | (a << 8) | b
-}
-
 impl Model {
     fn new(base: usize, x86ctx: bool) -> Model {
         Model {
@@ -889,13 +595,7 @@ impl Model {
         let s = self.state;
         let ps = pos & 3;
         let lit_byte = if matches!(t, Tok::Lit) && pos < buf.len() { buf[pos] as u32 } else { 0 };
-        // the order-2 context feeds only the mixing / two-counter literal models
-        let ctx2 = if LIGHT == 1 || LIGHT == 4 { 0 } else { h2_of(buf, pos) };
-        if LIGHT != 1 && LIGHT != 4 {
-            self.lit.prefetch(ctx2);
-        }
         if pos >= self.seg_end {
-            io.cat(0);
             let seg = pos >> SEG_BITS;
             self.seg_end = (seg + 1) << SEG_BITS;
             let want = self.flags.get(seg).copied().unwrap_or(false) as u32;
@@ -903,20 +603,16 @@ impl Model {
         }
         let out;
         let mut byte = 0u8;
-        io.cat(1);
         if self.dense || bit(io, &mut self.is_match[s][ps], (t != Tok::Lit) as u32) == 0 {
-            io.cat(if s >= 7 { 3 } else { 2 });
             let prev = if pos > 0 { buf[pos - 1] as u32 } else { 0 };
             let r0 = self.reps[0] as usize + 1;
             let mb = if pos >= r0 { buf[pos - r0] as u32 } else { 0 };
             let op = if self.x86ctx { op_ctx(buf, pos, self.base) } else { (0, 0) };
-            byte = self.lit.code(io, lit_byte, prev, ctx2, mb, pos, s >= 7, op) as u8;
+            byte = self.lit.code(io, lit_byte, prev, mb, s >= 7, op) as u8;
             out = Tok::Lit;
-        } else if { io.cat(4); bit(io, &mut self.is_rep[s], matches!(t, Tok::Rep(..) | Tok::Short) as u32) == 0 } {
+        } else if bit(io, &mut self.is_rep[s], matches!(t, Tok::Rep(..) | Tok::Short) as u32) == 0 {
             let (l, d) = if let Tok::Match(l, d) = t { (l as u32, d) } else { (2, 0) };
-            io.cat(5);
             let l = self.mlen.code(io, l - 2, ps) + 2;
-            io.cat(6);
             let d = self.dist.code(io, d, (l as usize - 2).min(3));
             out = Tok::Match(l as u16, d);
         } else {
@@ -930,7 +626,6 @@ impl Model {
                     out = Tok::Short;
                 } else {
                     let l = if let Tok::Rep(_, l) = t { l as u32 } else { 2 };
-                    io.cat(8);
                     out = Tok::Rep(0, (self.rlen.code(io, l - 2, ps) + 2) as u16);
                 }
             } else {
@@ -942,7 +637,6 @@ impl Model {
                     3
                 };
                 let l = if let Tok::Rep(_, l) = t { l as u32 } else { 2 };
-                io.cat(8);
                 out = Tok::Rep(kk, (self.rlen.code(io, l - 2, ps) + 2) as u16);
             }
         }
@@ -1305,7 +999,7 @@ impl<const A: usize> Parser<A> {
                         return;
                     }
                     let s1 = next_state(s, first);
-                    let lit = m.lit.cost(t, buf[at] as u32, buf[at - 1] as u32, h2_of(buf, at), buf[at - d] as u32, at, true, if m.x86ctx { op_ctx(buf, at, m.base) } else { (0, 0) });
+                    let lit = m.lit.cost(t, buf[at] as u32, buf[at - 1] as u32, buf[at - d] as u32, true, if m.x86ctx { op_ctx(buf, at, m.base) } else { (0, 0) });
                     let s2 = next_state(s1, Tok::Lit);
                     let ps2 = (at + 1) & 3;
                     let price = base
@@ -1323,7 +1017,7 @@ impl<const A: usize> Parser<A> {
                     );
                 };
                 // literal (its price depends only on the match byte and the matched flag)
-                let lit = if FULL_PRICE {
+                let lit = {
                     let r0 = nd.reps[0] as usize + 1;
                     let mb = if pos >= r0 { buf[pos - r0] as u32 } else { 0 };
                     let key = mb | ((s >= 7) as u32) << 8;
@@ -1331,13 +1025,11 @@ impl<const A: usize> Parser<A> {
                         Some(e) => e.1,
                         None => {
                             let op = if m.x86ctx { op_ctx(buf, pos, m.base) } else { (0, 0) };
-                            let c = m.lit.cost(t, buf[pos] as u32, prev, h2_of(buf, pos), mb, pos, s >= 7, op);
+                            let c = m.lit.cost(t, buf[pos] as u32, prev, mb, s >= 7, op);
                             lit_memo[a] = (key, c);
                             c
                         }
                     }
-                } else {
-                    m.lit.price(t, buf[pos] as u32, prev)
                 };
                 relax(nodes, i + 1, nd.price + pr(t, m.is_match[s][ps], 0) + lit, Tok::Lit);
                 let mprice = nd.price + pr(t, m.is_match[s][ps], 1);
@@ -1574,141 +1266,6 @@ fn parse_seg_a<const A: usize>(buf: &[u8], n: usize, start: &Model, lists: &List
     out
 }
 
-/// Static prices for the GPU parser from the coder's model as it stands.
-fn gpu_prices(m: &Model) -> Box<crate::gpu::LzPrices> {
-    // (boxed: 16 KB)
-    let t = price_table();
-    let mut p = Prices::new();
-    p.update(m, t);
-    let mut g = Box::new(crate::gpu::LzPrices {
-        lit_flag: [[0; 4]; 12],
-        match_flag: [[0; 4]; 12],
-        rep_flag: [[0; 2]; 12],
-        rep0: [[0; 2]; 12],
-        rep0long: [[[0; 2]; 4]; 12],
-        rep1: [[0; 2]; 12],
-        rep2: [[0; 2]; 12],
-        mlen: [[0; 272]; 4],
-        rlen: [[0; 272]; 4],
-        slot: p.slot,
-        small: p.small,
-        align: p.align,
-    });
-    for s in 0..STATES {
-        for ps in 0..4 {
-            g.lit_flag[s][ps] = pr(t, m.is_match[s][ps], 0);
-            g.match_flag[s][ps] = pr(t, m.is_match[s][ps], 1);
-            for b in 0..2 {
-                g.rep0long[s][ps][b] = pr(t, m.is_rep0_long[s][ps], b as u32);
-            }
-        }
-        for b in 0..2 {
-            g.rep_flag[s][b] = pr(t, m.is_rep[s], b as u32);
-            g.rep0[s][b] = pr(t, m.is_rep0[s], b as u32);
-            g.rep1[s][b] = pr(t, m.is_rep1[s], b as u32);
-            g.rep2[s][b] = pr(t, m.is_rep2[s], b as u32);
-        }
-    }
-    for ps in 0..4 {
-        g.mlen[ps].copy_from_slice(&p.mlen[ps]);
-        g.rlen[ps].copy_from_slice(&p.rlen[ps]);
-    }
-    g
-}
-
-/// Literal cost (1/16 bit) of every position of buf[s..e) under the coder's model as it
-/// stands (unmatched literal; the match byte is the one at the previous position's most
-/// recent repeat when known, else 0).
-fn lit_costs(m: &Model, buf: &[u8], s: usize, e: usize, threads: usize) -> Vec<u16> {
-    let t = price_table();
-    let chunks: Vec<(usize, usize)> = (s..e).step_by(1 << 16).map(|a| (a, (a + (1 << 16)).min(e))).collect();
-    let parts = crate::par::map(&chunks, threads, |&(a, b)| {
-        (a..b)
-            .map(|pos| {
-                let prev = if pos > 0 { buf[pos - 1] as u32 } else { 0 };
-                let op = if m.x86ctx { op_ctx(buf, pos, m.base) } else { (0, 0) };
-                m.lit.cost(t, buf[pos] as u32, prev, h2_of(buf, pos), 0, pos, false, op).min(65535) as u16
-            })
-            .collect::<Vec<u16>>()
-    });
-    parts.concat()
-}
-
-/// Replays tokens of [s, e) on a copy of the coder's model and records what an adaptive
-/// parser would have seen: prices at the start of every 64 KiB segment, and the literal
-/// cost of every position (with the model, match byte and state of that moment).
-fn adapt_prices(buf: &[u8], n: usize, start: &Model, toks: &[Out], s: usize, e: usize) -> (Vec<crate::gpu::LzPrices>, Vec<u16>) {
-    let t = price_table();
-    let mut w = start.clone();
-    let mut io = NullIo;
-    let mut prices = Vec::with_capacity((e - s).div_ceil(1 << SEG_BITS));
-    let mut lit = vec![0u16; e - s];
-    let mut pos = s;
-    let mut next_seg = s;
-    for o in toks {
-        if pos >= next_seg {
-            prices.push(*gpu_prices(&w));
-            next_seg = ((pos >> SEG_BITS) + 1) << SEG_BITS;
-        }
-        let tok = match o.tok {
-            Tok::Lit | Tok::Match(..) => o.tok,
-            Tok::Short if w.reps[0] == o.d => o.tok,
-            Tok::Rep(k, _) if w.reps[k as usize] == o.d => o.tok,
-            Tok::Short => Tok::Lit,
-            _ => match w.reps.iter().position(|&r| r == o.d) {
-                Some(k) => Tok::Rep(k as u8, o.len),
-                None => Tok::Match(o.len, o.d),
-            },
-        };
-        let r0 = w.reps[0] as usize + 1;
-        let matched = w.state >= 7;
-        for q in pos..pos + tok.len() {
-            let prev = if q > 0 { buf[q - 1] as u32 } else { 0 };
-            let mb = if q >= r0 { buf[q - r0] as u32 } else { 0 };
-            let op = if w.x86ctx { op_ctx(buf, q, w.base) } else { (0, 0) };
-            lit[q - s] = w.lit.cost(t, buf[q] as u32, prev, h2_of(buf, q), mb, q, matched && q == pos, op).min(65535) as u16;
-        }
-        w.code(&mut io, &buf[..n], pos, tok);
-        pos += tok.len();
-    }
-    (prices, lit)
-}
-
-/// GPU parse of one round of segments, or None (the CPU parses it instead).
-fn gpu_round(buf: &[u8], n: usize, m: &Model, l: &Lists, flags: &[bool], s: usize, e: usize, threads: usize, adapt: Option<(Vec<crate::gpu::LzPrices>, Vec<u16>)>) -> Option<Vec<Out>> {
-    let i0 = l.idx[s - l.start] as usize;
-    let i1 = l.idx[e - l.start] as usize;
-    let idx: Vec<u32> = l.idx[s - l.start..=e - l.start].iter().map(|&v| v - i0 as u32).collect();
-    let seg0 = s >> SEG_BITS;
-    let nseg = (e - s).div_ceil(1 << SEG_BITS);
-    let (prices, lit) = match adapt {
-        Some(a) => a,
-        None => (vec![*gpu_prices(m)], lit_costs(m, buf, s, e, threads)),
-    };
-    let segs = crate::gpu::lz_parse(&buf[..n], s, &idx, &l.m[i0..i1], flags, seg0, nseg, &prices, &lit)?;
-    let mut out = Vec::with_capacity((e - s) / 3);
-    for (k, sg) in segs.into_iter().enumerate() {
-        let a = (seg0 + k) << SEG_BITS;
-        let b = ((seg0 + k + 1) << SEG_BITS).min(e);
-        match sg {
-            None => out.extend((a..b).map(|_| Out { len: 0, d: 0, tok: Tok::Lit })),
-            Some(toks) => {
-                for (w, d) in toks {
-                    let len = (w & 511) as u16;
-                    let o = match (w >> 9) & 3 {
-                        0 => Out { len: 0, d: 0, tok: Tok::Lit },
-                        1 => Out { len: 1, d, tok: Tok::Short },
-                        2 => Out { len, d, tok: Tok::Rep(((w >> 11) & 3) as u8, len) },
-                        _ => Out { len, d, tok: Tok::Match(len, d) },
-                    };
-                    out.push(o);
-                }
-            }
-        }
-    }
-    Some(out)
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
@@ -1739,47 +1296,12 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
     let mut pos = d0;
     // the GPU finds every position's matches at once when it can (else the CPU match
     // finder runs ahead on its own thread); history segments need no lists
-    let gpu = if std::env::var_os("NZ_NOGPUMF").is_none() {
+    let gpu = if !crate::sys::dev_flag("NZ_NOGPUMF") {
         let skip: Vec<bool> = flags.iter().enumerate().map(|(i, &f)| f || (i + 1) << SEG_BITS <= d0).collect();
         crate::gpu::match_lists(&buf[..n], SEG_BITS, &skip).map(|(idx, m)| Lists { start: 0, idx, m })
     } else {
         None
     };
-    let gpu_parse = std::env::var_os("NZ_GPUPARSE").is_some() && d0 == 0;
-    let tok_stats = std::env::var_os("NZ_TOKSTATS").is_some();
-    let mut st = [0u64; 5];
-    let mut stl = [0u64; 5];
-    if gpu_parse {
-        if let Some(gl) = gpu.as_ref() {
-            // the whole piece in two GPU passes (pass 2 priced by a replay of pass 1),
-            // then one coding pass on the CPU
-            let parsed = gpu_round(buf, n, &m, gl, &flags, 0, n, threads, None).and_then(|first| {
-                if std::env::var_os("NZ_ONEPASS").is_some() {
-                    return Some(first);
-                }
-                let adapt = adapt_prices(buf, n, &m, &first, 0, n);
-                gpu_round(buf, n, &m, gl, &flags, 0, n, threads, Some(adapt))
-            });
-            if let Some(outs) = parsed {
-                for o in &outs {
-                    let t = match o.tok {
-                        Tok::Lit | Tok::Match(..) => o.tok,
-                        Tok::Short if m.reps[0] == o.d => o.tok,
-                        Tok::Rep(k, _) if m.reps[k as usize] == o.d => o.tok,
-                        Tok::Short => Tok::Lit,
-                        _ => match m.reps.iter().position(|&r| r == o.d) {
-                            Some(k) => Tok::Rep(k as u8, o.len),
-                            None => Tok::Match(o.len, o.d),
-                        },
-                    };
-                    m.code(&mut enc, &buf[..n], pos, t);
-                    pos += t.len();
-                }
-                debug_assert_eq!(pos, n);
-                return enc.finish();
-            }
-        }
-    }
     std::thread::scope(|sc| {
         // the match finder runs ahead on its own thread (it only depends on the data)
         let (tx, rx) = std::sync::mpsc::sync_channel::<Lists>(PROUND);
@@ -1827,12 +1349,6 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
                         None => Tok::Match(o.len, o.d),
                     },
                 };
-                if tok_stats {
-                    let k = match t { Tok::Lit => 0, Tok::Short => 1, Tok::Rep(..) => 2, Tok::Match(..) => 3 };
-                    st[k] += 1;
-                    stl[k] += t.len() as u64;
-                    if t != o.tok { st[4] += 1; }
-                }
                 if t == Tok::Lit {
                     view.v[pos] = buf[pos];
                 }
@@ -1840,9 +1356,6 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
                 view.apply(buf, pos, t, m.reps[0]);
                 pos += t.len();
             }
-        }
-        if tok_stats {
-            eprintln!("  tokens: lit {} short {} rep {} (bytes {}) match {} (bytes {}) remapped {}", st[0], st[1], st[2], stl[2], st[3], stl[3], st[4]);
         }
     });
     debug_assert_eq!(pos, n);
@@ -2004,7 +1517,7 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     };
     // capped effort marks bulk data that must go fast: smaller sub-blocks spread it over
     // more threads (and keep one block from running alone at the end)
-    let sub = if arr != 0 && std::env::var_os("NZ_SUB").is_none() { sub_size(data.len(), threads, code).min(FAST_SUB) } else { sub_size(data.len(), threads, code) };
+    let sub = if arr != 0 && !crate::sys::dev_flag("NZ_SUB") { sub_size(data.len(), threads, code).min(FAST_SUB) } else { sub_size(data.len(), threads, code) };
     let parts: Vec<(usize, &[u8])> =
         if data.is_empty() { vec![(0, data)] } else { data.chunks(sub).enumerate().map(|(i, c)| (i * sub, c)).collect() };
     let coded = crate::par::map(&parts, threads, |&(base, p)| {
@@ -2016,7 +1529,7 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
             buf.extend_from_slice(&data[base - d0..base + p.len()]);
             buf.resize(n + NICE + 8, 0);
             let b0 = base - d0;
-            let c = if std::env::var_os("NZ_NOMT").is_none() && p.len() >= 2 * PSEG {
+            let c = if !crate::sys::dev_flag("NZ_NOMT") && p.len() >= 2 * PSEG {
                 #[cfg(target_arch = "x86_64")]
                 let c = if crate::codec::has_avx2() { unsafe { encode_mt_avx2(&buf, n, d0, b0, x86ctx, threads, arr) } } else { encode_sub_mt(&buf, n, d0, b0, x86ctx, threads, arr) };
                 #[cfg(not(target_arch = "x86_64"))]
@@ -2092,60 +1605,6 @@ pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<
     Ok(out)
 }
 
-/// Dev: decodes an encoded stream and prints the cost of each part of the model.
-pub fn stats(src: &[u8], n: usize, x86ctx: bool) {
-    let mut r = src;
-    let sub = crate::container::read_varint(&mut r).unwrap() as usize;
-    let k = crate::container::read_varint(&mut r).unwrap() as usize;
-    let lens: Vec<usize> = (0..k).map(|_| crate::container::read_varint(&mut r).unwrap() as usize).collect();
-    let mut bits = [0f64; 16];
-    let mut cnt = [0u64; 16];
-    let mut hist = [0u64; 32];
-    let mut off = 0;
-    for (i, &l) in lens.iter().enumerate() {
-        let len = sub.min(n - i * sub);
-        let mut io = crate::coder::StatDec { d: Decoder::new(&r[off..off + l]), c: 0, bits: [0.0; 16], n: [0; 16] };
-        off += l;
-        let mut m = Model::new(i * sub, x86ctx);
-        let mut out: Vec<u8> = Vec::with_capacity(len);
-        while out.len() < len {
-            let pos = out.len();
-            let (t, b) = m.code(&mut io, &out, pos, Tok::Lit);
-            if let Tok::Lit = t {
-                out.push(b);
-            } else {
-                let d = match t {
-                    Tok::Match(_, d) => d as usize,
-                    _ => m.reps[0] as usize,
-                } + 1;
-                hist[(usize::BITS - d.leading_zeros()) as usize] += t.len() as u64;
-                for _ in 0..t.len() {
-                    let c = out[out.len() - d];
-                    out.push(c);
-                }
-            }
-        }
-        for c in 0..16 {
-            bits[c] += io.bits[c];
-            cnt[c] += io.n[c];
-        }
-    }
-    let names = ["dense", "is_match", "lit", "lit after match", "rep flags", "match len", "dist slot", "dist extra", "rep len"];
-    let total: f64 = bits.iter().sum();
-    for (c, name) in names.iter().enumerate() {
-        println!("{name:>16}: {:>11.0} bytes {:5.1}%  n={:>10}  {:.2} bits each", bits[c] / 8.0, bits[c] * 100.0 / total, cnt[c], bits[c] / cnt[c].max(1) as f64);
-    }
-    println!("{:>16}: {:>11.0} bytes", "total", total / 8.0);
-    let all: u64 = hist.iter().sum();
-    let mut acc = 0;
-    for (b, &h) in hist.iter().enumerate() {
-        if h > 0 {
-            acc += h;
-            println!("  dist < 2^{b:<2}: {:5.1}% of match bytes (cum {:5.1}%)", h as f64 * 100.0 / all as f64, acc as f64 * 100.0 / all as f64);
-        }
-    }
-}
-
 /// Memory to encode a sub-block of `len` bytes (match finder + model + parser).
 fn mem_for(len: usize) -> u64 {
     (4 << H4_BITS) + (4 << H3_BITS) + 8 * len as u64 + (24 << 20)
@@ -2212,7 +1671,7 @@ mod litperf {
         for pos in 0..buf.len() {
             let prev = if pos > 0 { buf[pos - 1] as u32 } else { 0 };
             let mb = if pos >= 4 { buf[pos - 4] as u32 } else { 0 };
-            lit.code(&mut enc, buf[pos] as u32, prev, super::h2_of(buf, pos), mb, pos, false, (0, 0));
+            lit.code(&mut enc, buf[pos] as u32, prev, mb, false, (0, 0));
         }
         enc.finish()
     }
@@ -2224,7 +1683,7 @@ mod litperf {
         for pos in 0..n {
             let prev = if pos > 0 { out[pos - 1] as u32 } else { 0 };
             let mb = if pos >= 4 { out[pos - 4] as u32 } else { 0 };
-            let b = lit.code(&mut dec, 0, prev, super::h2_of(&out, pos), mb, pos, false, (0, 0));
+            let b = lit.code(&mut dec, 0, prev, mb, false, (0, 0));
             out.push(b as u8);
         }
         out

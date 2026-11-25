@@ -2,6 +2,25 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Developer switch from the environment (tuning, tracing, forcing a code path). Only
+/// builds with `--features tune` read them: a release binary behaves the same whatever
+/// the environment holds.
+pub fn dev_var(name: &str) -> Option<String> {
+    #[cfg(feature = "tune")]
+    {
+        std::env::var(name).ok()
+    }
+    #[cfg(not(feature = "tune"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+pub fn dev_flag(name: &str) -> bool {
+    dev_var(name).is_some()
+}
+
 pub fn cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }

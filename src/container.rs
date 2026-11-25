@@ -154,7 +154,7 @@ fn stored(data: &[u8], crc: u32, note: &'static str) -> Packed {
 static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 fn trace(what: &str, len: usize) {
-    if std::env::var_os("NZIP_TRACE").is_some() {
+    if crate::sys::dev_flag("NZIP_TRACE") {
         let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
         eprintln!("  [{t:7.2}s] {what} ({} MB)", len >> 20);
     }
@@ -558,9 +558,6 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
                 return Ok(None);
             }
             nblock += 1;
-            if let Some(d) = std::env::var_os("NZ_DUMPBLOCKS") {
-                std::fs::write(std::path::Path::new(&d).join(format!("b{nblock}")), &b)?;
-            }
             Ok(Some(b))
         },
         |b: Vec<u8>| {

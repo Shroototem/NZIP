@@ -4,7 +4,7 @@
 pub fn has_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        std::env::var_os("NZIP_NO_AVX2").is_none()
+        !crate::sys::dev_flag("NZIP_NO_AVX2")
             && is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("bmi2")
             && is_x86_feature_detected!("lzcnt")

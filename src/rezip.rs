@@ -113,10 +113,10 @@ pub struct Expanded {
 /// Replaces every deflate stream in `b` that our zlib port rebuilds exactly with its
 /// inflated bytes. None when there is nothing to gain. The output stays under `limit`.
 pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
-    if std::env::var_os("NZ_NOREZIP").is_some() {
+    if crate::sys::dev_flag("NZ_NOREZIP") {
         return None;
     }
-    let tm = std::env::var_os("NZ_RZT").is_some();
+    let tm = crate::sys::dev_flag("NZ_RZT");
     let t0 = std::time::Instant::now();
     let lap = |what: &str| {
         if tm {
