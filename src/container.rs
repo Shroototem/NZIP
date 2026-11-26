@@ -19,7 +19,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -228,6 +228,10 @@ fn lz_payload(data: &[u8], x86: bool, threads: usize, arr: usize) -> Vec<u8> {
     out
 }
 
+/// Blocks up to this size are coded by both engines (the smaller kept) instead of
+/// picking one from a sample.
+const FULL_TRY: usize = 16 << 20;
+
 /// Evenly spread slices of a big block, used to pick an engine cheaply.
 fn sample_of(data: &[u8]) -> Vec<u8> {
     const SLICES: usize = 4;
@@ -418,14 +422,16 @@ fn pack_plain(data: &[u8], threads: usize, arr: usize) -> (u8, Vec<u8>, &'static
             bwt_payload(d, 0, threads)
         }
     };
-    if data.len() <= 2 << 20 {
-        let b = bwt_full(data);
-        let l = lz_payload(data, x86, threads, arr);
+    // small blocks: both engines code all of it at once and the smaller wins (no sample)
+    if data.len() <= FULL_TRY {
+        let mut both = par::map(&[false, true], 2, |&lz| if lz { lz_payload(data, x86, threads, arr) } else { bwt_full(data) });
+        let (l, b) = (both.pop().unwrap(), both.pop().unwrap());
         return if l.len() < b.len() { (KIND_LZX, l, if x86 { "x86+lz" } else { "lz" }) } else { (KIND_BWT, b, if x86 { "x86+bwt" } else { "bwt" }) };
     }
+    // both engines try the sample at once
     let s = sample_of(data);
-    let sb = bwt_full(&s).len();
-    let sl = lz_payload(&s, x86, threads, arr).len();
+    let tried = par::map(&[false, true], 2, |&lz| if lz { lz_payload(&s, x86, threads, arr).len() } else { bwt_full(&s).len() });
+    let (sb, sl) = (tried[0], tried[1]);
     trace(if sl <= sb { "engine: lz" } else { "engine: bwt" }, data.len());
     if sl <= sb {
         (KIND_LZX, lz_payload(data, x86, threads, arr), if x86 { "x86+lz" } else { "lz" })
@@ -496,8 +502,13 @@ pub struct Stats {
     pub largest: u64,
 }
 
-/// `cuts`: sorted stream offsets where a block boundary is preferred (file / type changes).
-pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out: W, o: &Options, cuts: &[u64]) -> io::Result<Stats> {
+/// `cuts`: sorted stream offsets where a block boundary is preferred: (offset, type change),
+/// at every file start.
+pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out: W, o: &Options, cuts: &[(u64, bool)]) -> io::Result<Stats> {
+    // the GPU driver starts in the background while the first blocks are read and tried
+    if o.mode == Mode::Max && total >= 4 << 20 {
+        crate::gpu::warm();
+    }
     let bs = o.block_size.unwrap_or_else(|| choose_block_size(total, o.mode)).max(1);
     let threads = o.threads.max(1);
     // blocks in flight: limited by free RAM; spare threads work inside each block
@@ -519,7 +530,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     // LZ sub-blocks are sized from the work in flight per thread (fixed for the run, so
     // the output does not depend on timing)
     crate::lzx::set_share(((workers * bs) as u64).min(total.max(1)).div_ceil(threads as u64) as usize);
-    crate::lzx::set_effort(threads);
+    crate::lzx::set_effort(threads, total);
     let mut eof = false;
     let mut nblock = 0usize;
     let verbose = o.verbose;
@@ -530,13 +541,18 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
             if eof {
                 return Ok(None);
             }
-            let mut want = bs as u64;
-            while ci < cuts.len() && cuts[ci] < pos + min_fill {
+            let end = pos + bs as u64;
+            while ci < cuts.len() && cuts[ci].0 <= pos {
                 ci += 1;
             }
-            if ci < cuts.len() && cuts[ci] < pos + want {
-                want = cuts[ci] - pos;
-            }
+            let ahead = cuts[ci..].iter().take_while(|c| c.0 < end);
+            // a change of file type ends the block (once it holds min_fill); otherwise the
+            // block takes as many whole files as fit, cutting a file only if it must
+            let want = match ahead.clone().find(|c| c.1 && c.0 >= pos + min_fill) {
+                Some(c) => c.0 - pos,
+                None if end >= total => bs as u64,
+                None => ahead.filter(|c| c.0 >= pos + bs as u64 / 2).last().map_or(bs as u64, |c| c.0 - pos),
+            };
             let want = want as usize;
             let mut b = vec![0u8; want];
             let n = read_full(&mut input, &mut b)?;

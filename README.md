@@ -34,8 +34,13 @@ block ─► word transform (text) / x86 filter (code) ─► BWT ─► CM code
 ```
 
 1. **Block planning.** Input is streamed in waves of blocks. Block size and the number of
-   blocks in flight come from the core count, free VRAM and the RAM budget. Folders cut
-   blocks at file and type boundaries, so unrelated data never shares a block.
+   blocks in flight come from the core count, free VRAM and the RAM budget. Folders are
+   ordered by extension and file name, blocks are filled with whole files and cut where
+   the file type changes, so similar files share a block and unrelated data does not.
+   Identical files are stored once, and pieces of files that repeat earlier content
+   anywhere in the folder (rebuilt programs, copies of a library) are stored as copies
+   (content-defined ~8 KB chunks, confirmed byte by byte) and rebuilt from the files
+   already unpacked.
 2. **Transforms.** Text gets a reversible word dictionary built from the block itself, so
    it works for any language. x86/x64 code gets an E8/E9 branch filter. Data that is
    already compressed (JPEG, MP4, zip...) is detected and stored.

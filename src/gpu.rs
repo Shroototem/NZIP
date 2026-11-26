@@ -158,6 +158,16 @@ fn lock(m: &'static Mutex<Gpu>) -> std::sync::MutexGuard<'static, Gpu> {
     m.lock().unwrap()
 }
 
+/// Starts the GPU driver on a background thread (it takes ~0.2 s), so the first job
+/// does not wait for it. No effect when the GPU is off.
+pub fn warm() {
+    if GPU_PCT.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        std::thread::spawn(|| {
+            let _ = gpu();
+        });
+    }
+}
+
 /// Why the GPU could not be used (shown by --info).
 static GPU_ERR: OnceLock<String> = OnceLock::new();
 

@@ -26,7 +26,8 @@ const DICT: usize = 16 << 20;
 /// Bytes of history before sub-block start `base`.
 #[inline]
 fn dict_len(base: usize) -> usize {
-    base.min(DICT)
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    base.min(*D.get_or_init(|| crate::sys::dev_var("NZ_DICT").and_then(|v| v.parse::<usize>().ok()).map_or(DICT, |m| m << 20)))
 }
 
 /// The decoder's first-pass view: literals as coded, copies copied from the view itself,
@@ -65,13 +66,20 @@ pub fn set_share(bytes: usize) {
     SHARE.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Arrivals the parser keeps per position (1, 2 or 4), from the threads compressing: more
-/// paths give ~1% smaller output for 1.4-2.5x the parse time, so they are only used where
-/// there are cores to spare. Dev override: NZ_ARR.
+/// Arrivals the parser keeps per position (1, 2 or 4): more paths give 1-2.5% smaller
+/// output for 1.5-2.7x the parse time. Dev override: NZ_ARR.
 static ARRIVALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
 
-pub fn set_effort(threads: usize) {
-    let a = if threads >= 16 { 4 } else if threads >= 6 { 2 } else { 1 };
+/// Picks the arrivals for a run of `bytes` on `threads` threads: the most that still
+/// finishes well ahead of 7-Zip Ultra. 7-Zip codes 256 MB blocks with one LZMA coder per
+/// two threads at about 5 MB/s each, so it is slow on small inputs and uses every core
+/// on big ones; nzip parses at about 0.8 / 1.2 / 1.5 MB/s per thread with 4 / 2 / 1
+/// arrivals on the CPU alone (a GPU only adds speed).
+pub fn set_effort(threads: usize, bytes: u64) {
+    let coders = (threads / 2).max(1).min(bytes.div_ceil(256 << 20).max(1) as usize);
+    let rival = coders as f64 * 5.0;
+    let ours = |a: usize| threads as f64 * if a == 4 { 0.8 } else if a == 2 { 1.2 } else { 1.5 };
+    let a = [4, 2, 1].into_iter().find(|&a| ours(a) >= rival * 1.1).unwrap_or(1);
     ARRIVALS.store(a, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -789,7 +797,9 @@ impl Mf {
 
     /// Inserts the history bytes [0, d0) (except dense segments).
     fn insert_history(&mut self, buf: &[u8], n: usize, d0: usize, flags: &[bool]) {
-        for p in 0..d0 {
+        // every second position: matches into history start at most one byte later,
+        // for half the work
+        for p in (0..d0).step_by(2) {
             if !flags[p >> SEG_BITS] {
                 self.walk(buf, n, p, None);
             }
@@ -873,9 +883,29 @@ impl Prices {
     }
 }
 
-struct Parser<const A: usize> {
+/// Arrivals per position, plus a compact copy of each position's reject bound (most
+/// candidate paths are rejected, and the bound stays in cache where the arrivals do not).
+struct Table<const A: usize> {
     /// `A` cheapest arrivals per position, sorted by price
-    nodes: Vec<[Node; A]>,
+    n: Vec<[Node; A]>,
+    /// a path to the position costing this much or more cannot be kept
+    lim: Vec<u32>,
+}
+
+impl<const A: usize> Table<A> {
+    #[inline(always)]
+    fn bound(l: &[Node; A]) -> u32 {
+        l[A - 1].price.min(l[0].price.saturating_add(TOL + 1))
+    }
+    #[inline(always)]
+    fn put(&mut self, j: usize, nd: Node) {
+        insert(&mut self.n[j], nd);
+        self.lim[j] = Self::bound(&self.n[j]);
+    }
+}
+
+struct Parser<const A: usize> {
+    nodes: Table<A>,
     matches: Vec<(u32, u32)>,
     prices: Prices,
     since: usize,
@@ -927,7 +957,7 @@ fn insert<const A: usize>(list: &mut [Node; A], nd: Node) {
 
 impl<const A: usize> Parser<A> {
     fn new() -> Parser<A> {
-        Parser { nodes: vec![[EMPTY; A]; WIN + 2 * MAX_LEN + 4], matches: Vec::with_capacity(64), prices: Prices::new(), since: usize::MAX / 2 }
+        Parser { nodes: Table { n: vec![[EMPTY; A]; WIN + 2 * MAX_LEN + 4], lim: vec![INF; WIN + 2 * MAX_LEN + 4] }, matches: Vec::with_capacity(64), prices: Prices::new(), since: usize::MAX / 2 }
     }
 
     /// Chooses tokens for buf[pos0..end); returns them in order.
@@ -942,11 +972,12 @@ impl<const A: usize> Parser<A> {
         }
         let w = WIN.min(limit - pos0);
         let span = (w + MAX_LEN + 1).min(n - pos0 + 1);
-        let last = span.min(self.nodes.len() - 1);
-        for nd in &mut self.nodes[..=last] {
+        let last = span.min(self.nodes.n.len() - 1);
+        for nd in &mut self.nodes.n[..=last] {
             *nd = [EMPTY; A];
         }
-        self.nodes[0][0] = Node { price: 0, reps: m.reps, state: m.state as u8, ..EMPTY };
+        self.nodes.lim[..=last].fill(INF);
+        self.nodes.n[0][0] = Node { price: 0, reps: m.reps, state: m.state as u8, ..EMPTY };
         let mut end = w;
         let mut i = 0;
         while i < end {
@@ -963,7 +994,7 @@ impl<const A: usize> Parser<A> {
                     }
                 }
             }
-            if self.nodes[i][0].price == INF {
+            if self.nodes.n[i][0].price == INF {
                 i += 1;
                 continue;
             }
@@ -976,22 +1007,22 @@ impl<const A: usize> Parser<A> {
             let mut rep_memo = [(0usize, 0usize); 8];
             let mut memo_n = 0usize;
             for a in 0..A {
-                let nd = self.nodes[i][a];
+                let nd = self.nodes.n[i][a];
                 if nd.price == INF {
                     break;
                 }
                 let s = nd.state as usize;
                 let prices = &self.prices;
                 let nodes = &mut self.nodes;
-                let relax = |nodes: &mut Vec<[Node; A]>, j: usize, price: u32, tok: Tok| {
+                let relax = |nodes: &mut Table<A>, j: usize, price: u32, tok: Tok| {
                     // far dearer than the best way here: cannot win later
-                    if price >= nodes[j][A - 1].price || price > nodes[j][0].price.saturating_add(TOL) {
+                    if price >= nodes.lim[j] {
                         return;
                     }
-                    insert(&mut nodes[j], Node { price, from: i as u32, from_a: a as u8, tok, reps: next_reps(nd.reps, tok), state: next_state(s, tok) as u8, chain: false, first: Tok::Lit });
+                    nodes.put(j, Node { price, from: i as u32, from_a: a as u8, tok, reps: next_reps(nd.reps, tok), state: next_state(s, tok) as u8, chain: false, first: Tok::Lit });
                 };
                 // `first`, one literal, then rep0 again: LZMA's two-step lookahead
-                let lookahead = |nodes: &mut Vec<[Node; A]>, first: Tok, base: u32| {
+                let lookahead = |nodes: &mut Table<A>, first: Tok, base: u32| {
                     if !LOOKAHEAD || a >= LOOK_ARR {
                         return;
                     }
@@ -1014,7 +1045,8 @@ impl<const A: usize> Parser<A> {
                         return;
                     }
                     let s1 = next_state(s, first);
-                    let lit = m.lit.cost(t, buf[at] as u32, buf[at - 1] as u32, buf[at - d] as u32, true, if m.x86ctx { op_ctx(buf, at, m.base) } else { (0, 0) });
+                    let op = if m.x86ctx { op_ctx(buf, at, m.base) } else { (0, 0) };
+                    let lit = m.lit.cost(t, buf[at] as u32, buf[at - 1] as u32, buf[at - d] as u32, true, op);
                     let s2 = next_state(s1, Tok::Lit);
                     let ps2 = (at + 1) & 3;
                     let price = base
@@ -1026,8 +1058,8 @@ impl<const A: usize> Parser<A> {
                         + pr(t, m.is_rep0_long[s2][ps2], 1)
                         + prices.rlen[ps2][l2 - 2];
                     let tok = Tok::Rep(0, l2 as u16);
-                    insert(
-                        &mut nodes[i + l + 1 + l2],
+                    nodes.put(
+                        i + l + 1 + l2,
                         Node { price, from: i as u32, from_a: a as u8, tok, reps: next_reps(next_reps(reps1, Tok::Lit), tok), state: next_state(s2, tok) as u8, chain: true, first },
                     );
                 };
@@ -1086,8 +1118,14 @@ impl<const A: usize> Parser<A> {
                         }
                         continue;
                     }
-                    for l in 2..=len {
-                        relax(nodes, i + l, base + prices.rlen[ps][l - 2], Tok::Rep(k as u8, l as u16));
+                    if a > 0 {
+                        // extra arrivals: the full length only (shorter ones rarely win
+                        // from a dearer start)
+                        relax(nodes, i + len, base + prices.rlen[ps][len - 2], Tok::Rep(k as u8, len as u16));
+                    } else {
+                        for l in 2..=len {
+                            relax(nodes, i + l, base + prices.rlen[ps][l - 2], Tok::Rep(k as u8, l as u16));
+                        }
                     }
                     lookahead(nodes, Tok::Rep(k as u8, len as u16), base + prices.rlen[ps][len - 2]);
                 }
@@ -1119,11 +1157,11 @@ impl<const A: usize> Parser<A> {
             }
             if longest > 0 {
                 // take the long match from the cheapest arrival: the window ends where it ends
-                let nd = self.nodes[i][0];
+                let nd = self.nodes.n[i][0];
                 let j = i + longest;
                 let s = nd.state as usize;
-                self.nodes[j] = [EMPTY; A];
-                self.nodes[j][0] = Node { price: nd.price, from: i as u32, from_a: 0, tok: long_tok, reps: next_reps(nd.reps, long_tok), state: next_state(s, long_tok) as u8, chain: false, first: Tok::Lit };
+                self.nodes.n[j] = [EMPTY; A];
+                self.nodes.n[j][0] = Node { price: nd.price, from: i as u32, from_a: 0, tok: long_tok, reps: next_reps(nd.reps, long_tok), state: next_state(s, long_tok) as u8, chain: false, first: Tok::Lit };
                 if let MatchSrc::Live(mf) = src {
                     for q in pos + 1..pos + longest {
                         mf.insert(buf, n, q);
@@ -1138,7 +1176,7 @@ impl<const A: usize> Parser<A> {
         let start = toks.len();
         let (mut j, mut a) = (end, 0usize);
         while j > 0 {
-            let nd = self.nodes[j][a];
+            let nd = self.nodes.n[j][a];
             toks.push(nd.tok);
             if nd.chain {
                 toks.push(Tok::Lit);

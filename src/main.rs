@@ -6,6 +6,7 @@ mod cm;
 mod codec;
 mod coder;
 mod container;
+mod dedup;
 mod gpu;
 mod lz;
 mod lzx;
@@ -13,6 +14,8 @@ mod mix;
 mod outfile;
 mod mixer;
 mod par;
+#[cfg(feature = "tune")]
+mod prof;
 mod progress;
 mod rezip;
 mod sais;
@@ -169,13 +172,15 @@ fn run(a: Args) -> io::Result<()> {
             let (guard, file) = outfile::OutFile::create(&out_path, a.force)?;
             let mut out = BufWriter::with_capacity(1 << 20, file);
             let mut dup_bytes = 0u64;
-            let (src, total, flags, cuts): (Box<dyn io::Read>, u64, u8, Vec<u64>) = if input.is_dir() {
+            let (src, total, flags, cuts): (Box<dyn io::Read>, u64, u8, Vec<(u64, bool)>) = if input.is_dir() {
                 // never pack the archive being written, wherever -o puts it
                 let mut entries = archive::scan(&input, Some(guard.temp_path()))?;
                 dup_bytes = archive::find_dups(&mut entries, opts.threads)?;
-                if opts.verbose && dup_bytes > 0 {
-                    eprintln!("  duplicate files: {dup_bytes} bytes stored once");
+                let rep = archive::find_repeats(&mut entries, opts.threads)?;
+                if opts.verbose {
+                    eprintln!("  duplicate files: {dup_bytes} bytes; repeated pieces: {rep} bytes (copied, not compressed)");
                 }
+                dup_bytes += rep;
                 let (r, total, cuts) = archive::PackReader::new(&entries);
                 (Box::new(r), total, FLAG_DIR, cuts)
             } else {
@@ -307,7 +312,12 @@ fn main() {
     };
     let verbose = a.verbose;
     par::set_threads(a.threads);
-    if let Err(e) = run(a) {
+    #[cfg(feature = "tune")]
+    prof::start();
+    let r = run(a);
+    #[cfg(feature = "tune")]
+    prof::dump();
+    if let Err(e) = r {
         eprintln!("nzip: {e}");
         std::process::exit(1);
     }

@@ -6,13 +6,18 @@
 //! manifest = count:varint { kind:u8 path_len:varint path(utf-8, '/') extra }
 //!   kind 0 = file, extra = size:varint (its bytes follow in the stream, in entry order)
 //!   kind 1 = folder, no extra
-//!   kind 2 = duplicate file, extra = index:varint of an earlier kind-0 entry with the same
-//!            bytes (no stream bytes; unpacking copies the earlier file)
+//!   kind 2 = duplicate file, extra = index:varint of an earlier kind-0/3 entry with the
+//!            same bytes (no stream bytes; unpacking copies the earlier file)
+//!   kind 3 = file in pieces (see dedup.rs), extra = size:varint count:varint pieces:
+//!            literal = (len << 1):varint, its bytes follow in the stream;
+//!            copy    = (len << 1 | 1):varint back:varint off:varint, bytes [off, off + len)
+//!                      of entry (this index - back), an earlier kind-0/3 entry or this one
 //! ```
 
 use crate::container::{read_varint, write_varint};
+use crate::dedup::Seg;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 pub struct Entry {
@@ -22,10 +27,12 @@ pub struct Entry {
     pub path: PathBuf,
     /// Index of an earlier entry with identical bytes (set by `find_dups`).
     pub dup: Option<usize>,
+    /// The file's pieces when parts of it repeat earlier content (set by `find_repeats`).
+    pub segs: Option<Vec<Seg>>,
 }
 
-/// Lists a folder recursively. Files are grouped by extension so that similar data sits
-/// together in the stream (better models, better matches).
+/// Lists a folder recursively. Files are grouped by extension and name so that similar data
+/// sits together in the stream (better models, better matches).
 /// `skip` (the archive being written) is left out even when it lies inside `root`.
 pub fn scan(root: &Path, skip: Option<&Path>) -> io::Result<Vec<Entry>> {
     let skip = skip.and_then(|p| Some((p.file_name()?.to_os_string(), fs::canonicalize(p).ok()?)));
@@ -42,7 +49,7 @@ pub fn scan(root: &Path, skip: Option<&Path>) -> io::Result<Vec<Entry>> {
                 .collect::<Vec<_>>()
                 .join("/");
             if ft.is_dir() {
-                out.push(Entry { rel, dir: true, size: 0, path: p.clone(), dup: None });
+                out.push(Entry { rel, dir: true, size: 0, path: p.clone(), dup: None, segs: None });
                 stack.push(p);
             } else if ft.is_file() {
                 if let Some((name, canon)) = &skip {
@@ -51,27 +58,45 @@ pub fn scan(root: &Path, skip: Option<&Path>) -> io::Result<Vec<Entry>> {
                     }
                 }
                 let size = e.metadata()?.len();
-                out.push(Entry { rel, dir: false, size, path: p, dup: None });
+                out.push(Entry { rel, dir: false, size, path: p, dup: None, segs: None });
             }
             // symlinks and special files are skipped
         }
     }
+    // folders first; files by extension, then by name (copies of one file in different
+    // folders sit side by side), then by path
+    let name = |e: &Entry| e.rel.rsplit_once('/').map_or(e.rel.as_str(), |(_, n)| n).to_string();
     let ext = |e: &Entry| e.rel.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-    out.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| ext(a).cmp(&ext(b))).then_with(|| a.rel.cmp(&b.rel)));
+    out.sort_by_cached_key(|e| (!e.dir, ext(e), name(e), e.rel.clone()));
     Ok(out)
 }
 
 pub fn manifest(entries: &[Entry]) -> Vec<u8> {
     let mut m = Vec::new();
     write_varint(&mut m, entries.len() as u64);
-    for e in entries {
-        m.push(if e.dir { 1 } else if e.dup.is_some() { 2 } else { 0 });
+    for (i, e) in entries.iter().enumerate() {
+        m.push(if e.dir { 1 } else if e.dup.is_some() { 2 } else if e.segs.is_some() { 3 } else { 0 });
         write_varint(&mut m, e.rel.len() as u64);
         m.extend_from_slice(e.rel.as_bytes());
         match (e.dir, e.dup) {
             (true, _) => {}
             (false, Some(k)) => write_varint(&mut m, k as u64),
-            (false, None) => write_varint(&mut m, e.size),
+            (false, None) => {
+                write_varint(&mut m, e.size);
+                if let Some(segs) = &e.segs {
+                    write_varint(&mut m, segs.len() as u64);
+                    for g in segs {
+                        match *g {
+                            Seg::Lit(l) => write_varint(&mut m, l << 1),
+                            Seg::Copy { src, off, len } => {
+                                write_varint(&mut m, len << 1 | 1);
+                                write_varint(&mut m, (i - src) as u64);
+                                write_varint(&mut m, off);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     m
@@ -170,20 +195,63 @@ pub fn find_dups(entries: &mut [Entry], threads: usize) -> io::Result<u64> {
     Ok(saved)
 }
 
+/// Marks repeated pieces of files (see dedup.rs): they are copied from earlier files when
+/// unpacking instead of being compressed. Returns the bytes saved.
+pub fn find_repeats(entries: &mut [Entry], threads: usize) -> io::Result<u64> {
+    let files: Vec<(usize, &Path, u64)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.dir && e.dup.is_none() && e.size >= crate::dedup::MIN_FILE)
+        .map(|(i, e)| (i, e.path.as_path(), e.size))
+        .collect();
+    let found = crate::dedup::find(&files, threads)?;
+    let idx: Vec<usize> = files.iter().map(|f| f.0).collect();
+    let mut saved = 0;
+    for (i, segs) in idx.into_iter().zip(found) {
+        if let Some(s) = &segs {
+            saved += s.iter().map(|g| if matches!(g, Seg::Copy { .. }) { g.len() } else { 0 }).sum::<u64>();
+        }
+        entries[i].segs = segs;
+    }
+    Ok(saved)
+}
+
+/// Bytes of a file that go into the stream: (offset, length) ranges.
+fn stream_ranges(e: &Entry) -> Vec<(u64, u64)> {
+    match &e.segs {
+        None => vec![(0, e.size)],
+        Some(segs) => {
+            let mut at = 0;
+            let mut r = Vec::new();
+            for g in segs {
+                if let Seg::Lit(l) = *g {
+                    r.push((at, l));
+                }
+                at += g.len();
+            }
+            r
+        }
+    }
+}
+
 /// Reader over manifest + every file's bytes.
 pub struct PackReader {
     head: io::Cursor<Vec<u8>>,
-    files: std::vec::IntoIter<(PathBuf, u64)>,
-    cur: Option<io::Take<File>>,
+    files: std::vec::IntoIter<(PathBuf, Vec<(u64, u64)>)>,
+    /// open file and its ranges still to read
+    cur: Option<(File, std::vec::IntoIter<(u64, u64)>)>,
+    /// bytes left in the range being read
+    left: u64,
 }
 
-/// Files at least this big get blocks of their own.
+/// Files at least this big and without an extension get blocks of their own.
 const BIG_FILE: u64 = 4 << 20;
 
 impl PackReader {
-    /// Returns the reader, the stream length, and preferred block cut points (stream
-    /// offsets): around every big file, and wherever the extension group changes.
-    pub fn new(entries: &[Entry]) -> (PackReader, u64, Vec<u64>) {
+    /// Returns the reader, the stream length, and preferred block cut points: every file
+    /// start, flagged where the extension group changes (and around big files without an
+    /// extension).
+    pub fn new(entries: &[Entry]) -> (PackReader, u64, Vec<(u64, bool)>) {
         let m = manifest(entries);
         let mut head = (m.len() as u64).to_le_bytes().to_vec();
         head.extend_from_slice(&m);
@@ -193,19 +261,25 @@ impl PackReader {
         let mut off = head.len() as u64;
         let mut prev_ext: Option<String> = None;
         let mut prev_big = false;
+        let mut list = Vec::with_capacity(files.len());
         for e in &files {
             let x = ext(e);
-            let big = e.size >= BIG_FILE;
-            if big || prev_big || prev_ext.as_ref().is_some_and(|p| *p != x) {
-                cuts.push(off);
+            let r = stream_ranges(e);
+            let size: u64 = r.iter().map(|q| q.1).sum();
+            if size > 0 {
+                // big files without an extension can be anything (text, images, programs):
+                // they keep blocks of their own, so each gets its own engine
+                let big = size >= BIG_FILE;
+                let alone = x.is_empty() && (big || prev_big);
+                cuts.push((off, alone || prev_ext.as_ref().is_some_and(|p| *p != x)));
+                prev_ext = Some(x);
+                prev_big = big;
             }
-            off += e.size;
-            prev_ext = Some(x);
-            prev_big = big;
+            off += size;
+            list.push((e.path.clone(), r));
         }
         let total = off;
-        let list = files.iter().map(|e| (e.path.clone(), e.size)).collect::<Vec<_>>();
-        (PackReader { head: io::Cursor::new(head), files: list.into_iter(), cur: None }, total, cuts)
+        (PackReader { head: io::Cursor::new(head), files: list.into_iter(), cur: None, left: 0 }, total, cuts)
     }
 }
 
@@ -216,18 +290,26 @@ impl Read for PackReader {
             return Ok(n);
         }
         loop {
-            if let Some(f) = &mut self.cur {
-                let n = f.read(buf)?;
-                if n > 0 {
-                    return Ok(n);
-                }
-                if f.limit() > 0 {
+            if self.left > 0 {
+                let f = &mut self.cur.as_mut().unwrap().0;
+                let k = (buf.len() as u64).min(self.left) as usize;
+                let n = f.read(&mut buf[..k])?;
+                if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "a file shrank while being read"));
+                }
+                self.left -= n as u64;
+                return Ok(n);
+            }
+            if let Some((f, ranges)) = &mut self.cur {
+                if let Some((off, len)) = ranges.next() {
+                    f.seek(io::SeekFrom::Start(off))?;
+                    self.left = len;
+                    continue;
                 }
                 self.cur = None;
             }
             match self.files.next() {
-                Some((p, size)) => self.cur = Some(File::open(&p)?.take(size)),
+                Some((p, ranges)) => self.cur = Some((File::open(&p)?, ranges.into_iter())),
                 None => return Ok(0),
             }
         }
@@ -242,15 +324,23 @@ fn safe_join(root: &Path, rel: &str) -> io::Result<PathBuf> {
     Ok(root.join(p))
 }
 
+/// How a file is rebuilt, in order.
+enum Part {
+    /// the next bytes of the stream
+    Stream(u64),
+    /// bytes [off, off + len) of an earlier file (or of this one)
+    Copy(PathBuf, u64, u64),
+}
+
 /// Writer that rebuilds the folder from the decompressed stream.
 pub struct Unpacker {
     root: PathBuf,
     head: Vec<u8>,
     need: Option<usize>,
-    /// Files in stream order: path, size, and the earlier file to copy for duplicates.
-    files: std::collections::VecDeque<(PathBuf, u64, Option<PathBuf>)>,
-    cur: Option<(File, u64)>,
-    /// Bytes written by copying duplicates (not in the stream).
+    /// Files in stream order: path, and either its parts or the earlier file it duplicates.
+    files: std::collections::VecDeque<(PathBuf, Result<std::collections::VecDeque<Part>, PathBuf>)>,
+    cur: Option<(File, std::collections::VecDeque<Part>)>,
+    /// Bytes written by copying (duplicate files and repeated pieces; not in the stream).
     copied: u64,
 }
 
@@ -260,10 +350,11 @@ impl Unpacker {
     }
 
     fn parse_manifest(&mut self) -> io::Result<()> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
         fs::create_dir_all(&self.root)?;
         let mut r = io::Cursor::new(&self.head[8..]);
         let n = read_varint(&mut r)?;
-        // path and kind of every entry so far (duplicates point back at these)
+        // path and kind of every entry so far (duplicates and copies point back at these)
         let mut seen: Vec<(PathBuf, u8)> = Vec::new();
         for _ in 0..n {
             let mut k = [0u8];
@@ -271,25 +362,76 @@ impl Unpacker {
             let len = read_varint(&mut r)? as usize;
             let mut name = vec![0u8; len];
             r.read_exact(&mut name)?;
-            let rel = String::from_utf8(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad path"))?;
+            let rel = String::from_utf8(name).map_err(|_| bad("bad path"))?;
             let p = safe_join(&self.root, &rel)?;
+            let src = |seen: &Vec<(PathBuf, u8)>, i: usize| match seen.get(i) {
+                Some((q, 0 | 3)) => Ok(q.clone()),
+                _ => Err(bad("bad copy source")),
+            };
             match k[0] {
                 1 => fs::create_dir_all(&p)?,
                 0 => {
                     let size = read_varint(&mut r)?;
-                    self.files.push_back((p.clone(), size, None));
+                    self.files.push_back((p.clone(), Ok([Part::Stream(size)].into_iter().filter(|q| !matches!(q, Part::Stream(0))).collect())));
                 }
                 2 => {
                     let i = read_varint(&mut r)? as usize;
-                    let src = match seen.get(i) {
-                        Some((q, 0)) => q.clone(),
-                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad duplicate entry")),
-                    };
-                    self.files.push_back((p.clone(), 0, Some(src)));
+                    self.files.push_back((p.clone(), Err(src(&seen, i)?)));
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad entry kind")),
+                3 => {
+                    let size = read_varint(&mut r)?;
+                    let count = read_varint(&mut r)?;
+                    let mut parts = std::collections::VecDeque::new();
+                    let mut at = 0u64;
+                    let me = seen.len();
+                    for _ in 0..count {
+                        let v = read_varint(&mut r)?;
+                        let l = v >> 1;
+                        if v & 1 == 0 {
+                            parts.push_back(Part::Stream(l));
+                        } else {
+                            let back = read_varint(&mut r)? as usize;
+                            let off = read_varint(&mut r)?;
+                            let from = if back == 0 {
+                                // an earlier part of this same file
+                                if off.checked_add(l).is_none_or(|e| e > at) {
+                                    return Err(bad("bad copy source"));
+                                }
+                                p.clone()
+                            } else {
+                                src(&seen, me.checked_sub(back).ok_or_else(|| bad("bad copy source"))?)?
+                            };
+                            parts.push_back(Part::Copy(from, off, l));
+                        }
+                        at = at.checked_add(l).ok_or_else(|| bad("bad piece"))?;
+                    }
+                    if at != size {
+                        return Err(bad("pieces do not add up to the file size"));
+                    }
+                    self.files.push_back((p.clone(), Ok(parts)));
+                }
+                _ => return Err(bad("bad entry kind")),
             }
             seen.push((p, k[0]));
+        }
+        Ok(())
+    }
+
+    /// Runs the copies at the front of the current file; closes it once it is complete.
+    fn run_copies(&mut self) -> io::Result<()> {
+        let Some((f, parts)) = &mut self.cur else { return Ok(()) };
+        while let Some(Part::Copy(src, off, len)) = parts.front() {
+            let mut g = File::open(src)?;
+            g.seek(io::SeekFrom::Start(*off))?;
+            let n = io::copy(&mut g.take(*len), f)?;
+            if n != *len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "copy source is too short"));
+            }
+            self.copied += n;
+            parts.pop_front();
+        }
+        if parts.is_empty() {
+            self.cur = None;
         }
         Ok(())
     }
@@ -297,18 +439,20 @@ impl Unpacker {
     fn open_next(&mut self) -> io::Result<()> {
         while self.cur.is_none() {
             match self.files.pop_front() {
-                Some((p, size, src)) => {
+                Some((p, how)) => {
                     if let Some(d) = p.parent() {
                         fs::create_dir_all(d)?;
                     }
-                    if let Some(src) = src {
+                    match how {
                         // the original came earlier in the stream, so it is complete
-                        self.copied += fs::copy(&src, &p)?;
-                        continue;
-                    }
-                    let f = File::create(&p)?;
-                    if size > 0 {
-                        self.cur = Some((f, size));
+                        Err(src) => self.copied += fs::copy(&src, &p)?,
+                        Ok(parts) => {
+                            let f = File::create(&p)?;
+                            if !parts.is_empty() {
+                                self.cur = Some((f, parts));
+                                self.run_copies()?;
+                            }
+                        }
                     }
                 }
                 None => return Ok(()),
@@ -317,12 +461,12 @@ impl Unpacker {
         Ok(())
     }
 
-    /// Ends unpacking; returns the bytes written by copying duplicate files.
+    /// Ends unpacking; returns the bytes written by copying (not decoded from the stream).
     pub fn finish(mut self) -> io::Result<u64> {
         if self.need.is_none() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "missing folder manifest"));
         }
-        self.open_next()?; // creates any remaining empty files
+        self.open_next()?; // creates any remaining empty or copied files
         if self.cur.is_some() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "archive ended before all files were written"));
         }
@@ -354,15 +498,17 @@ impl Write for Unpacker {
                 continue;
             }
             self.open_next()?;
-            let Some((f, left)) = &mut self.cur else {
+            let Some((f, parts)) = &mut self.cur else {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "extra data after last file"));
             };
+            let Some(Part::Stream(left)) = parts.front_mut() else { unreachable!() };
             let k = (*left).min(buf.len() as u64) as usize;
             f.write_all(&buf[..k])?;
             *left -= k as u64;
             buf = &buf[k..];
             if *left == 0 {
-                self.cur = None;
+                parts.pop_front();
+                self.run_copies()?;
             }
         }
         Ok(total)
