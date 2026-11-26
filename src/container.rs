@@ -577,7 +577,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     // LZ sub-blocks are sized from the work in flight per thread (fixed for the run, so
     // the output does not depend on timing)
     crate::lzx::set_share(((workers * bs) as u64).min(total.max(1)).div_ceil(threads as u64) as usize);
-    crate::lzx::set_effort(threads, total, o.mode == Mode::Max && total >= 32 << 20 && crate::gpu::free_vram().is_some());
+    crate::lzx::set_effort(threads, total);
     let mut eof = false;
     let mut nblock = 0usize;
     let verbose = o.verbose;

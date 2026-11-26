@@ -73,16 +73,41 @@ static ARRIVALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// Picks the arrivals for a run of `bytes` on `threads` threads: the most that still
 /// finishes well ahead of 7-Zip Ultra. 7-Zip codes 256 MB blocks with one LZMA coder per
 /// two threads at about 5 MB/s each, so it is slow on small inputs and uses every core
-/// on big ones; nzip parses at about 0.8 / 1.2 / 1.5 MB/s per thread with 4 / 2 / 1
-/// arrivals when a GPU finds the matches, 0.65 / 0.9 / 1.2 on the CPU alone.
-pub fn set_effort(threads: usize, bytes: u64, gpu: bool) {
+/// on big ones; nzip runs at about 0.65 / 0.9 / 1.2 MB/s per thread with 4 / 2 / 1
+/// arrivals on the CPU alone. The effort never depends on the GPU: a GPU only takes match
+/// finding off the CPU, so with one the same archive comes out faster.
+pub fn set_effort(threads: usize, bytes: u64) {
     let coders = (threads / 2).max(1).min(bytes.div_ceil(256 << 20).max(1) as usize);
     let rival = coders as f64 * 5.0;
-    // without a GPU the CPU also finds the matches
-    let rate = if gpu { [0.8, 1.2, 1.5] } else { [0.65, 0.9, 1.2] };
-    let ours = |a: usize| threads as f64 * if a == 4 { rate[0] } else if a == 2 { rate[1] } else { rate[2] };
+    let ours = |a: usize| threads as f64 * if a == 4 { 0.65 } else if a == 2 { 0.9 } else { 1.2 };
     let a = [4, 2, 1].into_iter().find(|&a| ours(a) >= rival * 1.1).unwrap_or(1);
     ARRIVALS.store(a, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A wait for the GPU counts as 1/GPU_BIAS of the CPU match finder's time: while a chunk
+/// waits, its core parses other chunks, whereas CPU match finding takes cores from
+/// parsing. (GPU lists also find slightly better matches.)
+const GPU_BIAS: u64 = 3;
+
+/// A CPU match finder hands the rest of its sub-block to an idle GPU when at least this
+/// much is left.
+const STEAL_MIN: usize = 8 << 20;
+
+/// Running average of the CPU match finder's time per byte it handles (inserted or
+/// searched), in picoseconds (0 = none yet).
+static MF_PS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a chunk's match lists should come from the GPU: when they would arrive (every
+/// job reserved ahead included) before the CPU match finder would be done with one
+/// sub-block (`cpu_bytes` inserted or searched). Both speeds are measured as the run
+/// goes, so the split adapts to any CPU and GPU (which chunks take which path depends on
+/// timing). A `true` reserves the GPU: the caller must then run the job.
+fn gpu_turn(job_bytes: usize, cpu_bytes: usize) -> bool {
+    let per = match MF_PS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 180_000,
+        p => p,
+    };
+    crate::gpu::mf_reserve(job_bytes, GPU_BIAS * per * cpu_bytes as u64)
 }
 
 /// Arrivals for a stream: `arr` caps the machine's effort (0 = no cap).
@@ -1213,32 +1238,60 @@ impl Lists {
         let i = pos - self.start;
         &self.m[self.idx[i] as usize..self.idx[i + 1] as usize]
     }
+}
 
-    /// From lists of stream positions counted from `w0` (start 0), those of the sub-block
-    /// [base, base + len) as positions of its buffer, which starts `d0` bytes of history
-    /// before it: matches that start before the buffer are dropped, lengths stop at its
-    /// end, and each list keeps strictly increasing lengths.
-    fn window(&self, w0: usize, base: usize, d0: usize, len: usize) -> Lists {
-        let b0 = base - d0;
-        let end = base + len;
-        let mut idx = Vec::with_capacity(len + 1);
-        let mut m = Vec::with_capacity(len * 2);
-        idx.push(0);
-        for g in base..end {
-            let lp = (g - b0) as u32;
-            let maxl = (end - g).min(MAX_LEN) as u32;
-            let mut last = 0;
-            for &(l, d) in self.at(g - w0) {
-                let l = l.min(maxl);
-                if d < lp && l > last {
-                    m.push((l, d));
-                    last = l;
-                }
+/// The list of position `p` in lists (`idx`, `m`) that start at position `start`.
+#[inline(always)]
+fn list_at<'a>(idx: &[u32], m: &'a [(u32, u32)], start: usize, p: usize) -> &'a [(u32, u32)] {
+    let i = p - start;
+    &m[idx[i] as usize..idx[i + 1] as usize]
+}
+
+/// From lists of buffer positions counted from `w0`, those of positions [s, e) of a
+/// buffer holding `n` coded bytes, as `find_lists` would give them.
+fn part_of(idx: &[u32], m: &[(u32, u32)], start: usize, w0: usize, s: usize, e: usize, n: usize) -> Lists {
+    let mut oi = Vec::with_capacity(e - s + 1);
+    let mut om = Vec::with_capacity((e - s) * 2);
+    oi.push(0);
+    for p in s..e {
+        let maxl = (n - p).min(MAX_LEN) as u32;
+        let mut last = 0;
+        for &(l, d) in list_at(idx, m, start, p - w0) {
+            let l = l.min(maxl);
+            if l > last {
+                om.push((l, d));
+                last = l;
             }
-            idx.push(m.len() as u32);
         }
-        Lists { start: d0, idx, m }
+        oi.push(om.len() as u32);
     }
+    Lists { start: s, idx: oi, m: om }
+}
+
+/// From lists of stream positions counted from `w0`, those of the sub-block
+/// [base, base + len) as positions of its buffer, which starts `d0` bytes of history
+/// before it: matches that start before the buffer are dropped, lengths stop at its
+/// end, and each list keeps strictly increasing lengths.
+fn window_of(idx: &[u32], m: &[(u32, u32)], start: usize, w0: usize, base: usize, d0: usize, len: usize) -> Lists {
+    let b0 = base - d0;
+    let end = base + len;
+    let mut oi = Vec::with_capacity(len + 1);
+    let mut om = Vec::with_capacity(len * 2);
+    oi.push(0);
+    for g in base..end {
+        let lp = (g - b0) as u32;
+        let maxl = (end - g).min(MAX_LEN) as u32;
+        let mut last = 0;
+        for &(l, d) in list_at(idx, m, start, g - w0) {
+            let l = l.min(maxl);
+            if d < lp && l > last {
+                om.push((l, d));
+                last = l;
+            }
+        }
+        oi.push(om.len() as u32);
+    }
+    Lists { start: d0, idx: oi, m: om }
 }
 
 /// Coded bytes per GPU match-list job: the sub-blocks of a chunk take their lists from
@@ -1393,16 +1446,47 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
             if on_gpu {
                 return;
             }
-            // effort-capped streams also search less
             // lower effort also searches less: capped streams much less
+            let t = std::time::Instant::now();
             let mut mf = Mf::new(n, if arr != 0 { DEPTH / 8 } else if effort(0) < 4 { DEPTH / 2 } else { DEPTH });
             let step = if arr != 0 || effort(0) == 1 { 4 } else { 2 };
             mf.insert_history(buf, n, d0, fl, step);
-            for &(s, e) in sg {
-                if tx.send(find_lists(&mut mf, buf, n, fl, s, e)).is_err() {
+            let mut busy = t.elapsed();
+            let mut done = d0;
+            for (k, &(s, e)) in sg.iter().enumerate() {
+                // the GPU has nothing to do: it takes over the rest of this sub-block
+                if n - s >= STEAL_MIN && crate::gpu::mf_idle() && !crate::sys::dev_flag("NZ_NOSTEAL") {
+                    let per = match MF_PS.load(std::sync::atomic::Ordering::Relaxed) {
+                        0 => 180_000,
+                        p => p,
+                    };
+                    let w = s - s.min(DICT);
+                    if crate::gpu::mf_reserve(n - w, GPU_BIAS * per * (n - s) as u64) {
+                        let skip: Vec<bool> = (w >> SEG_BITS..n.div_ceil(1 << SEG_BITS)).map(|g| fl[g] || (g + 1) << SEG_BITS <= s).collect();
+                        if let Some(all) = crate::gpu::match_lists_helper(&buf[w..n], SEG_BITS, &skip) {
+                            let parts: Vec<Lists> = sg[k..].iter().map(|&(s2, e2)| part_of(all.idx(), all.pairs(), 0, w, s2, e2, n)).collect();
+                            drop(all);
+                            for l in parts {
+                                if tx.send(l).is_err() {
+                                    return;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                let t = std::time::Instant::now();
+                let l = find_lists(&mut mf, buf, n, fl, s, e);
+                busy += t.elapsed();
+                done = e;
+                if tx.send(l).is_err() {
                     return;
                 }
             }
+            // time spent working (not waiting for the parser), per byte handled
+            let ps = (busy.as_nanos() as u64 * 1000 / (d0 / step + done - d0).max(1) as u64).max(1);
+            let old = MF_PS.load(std::sync::atomic::Ordering::Relaxed);
+            MF_PS.store(if old == 0 { ps } else { (old * 3 + ps) / 4 }, std::sync::atomic::Ordering::Relaxed);
         });
         for round in segs.chunks(PROUND) {
             let lists: Vec<Lists> = if on_gpu { Vec::new() } else { round.iter().map(|_| rx.recv().expect("match finder stopped")).collect() };
@@ -1621,22 +1705,35 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     // chunks of sub-blocks run at once; the GPU finds each chunk's match lists (with its
     // history) in one job, and its sub-blocks take their part. Without a GPU every
     // sub-block runs its own CPU match finder.
-    // Effort-capped streams (bulk data such as inflated zip entries) parse so fast that the
-    // GPU becomes the bottleneck while cores sit idle: every second chunk then uses the CPU
-    // match finder (a fixed split, so the archive does not depend on timing).
-    let groups: Vec<(usize, &[(usize, &[u8])])> = parts.chunks((GPU_CHUNK / sub).max(1)).enumerate().collect();
-    let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |&(gi, group)| {
+    // A chunk takes the GPU or the CPU match finder, whichever is expected to be done first.
+    let groups: Vec<&[(usize, &[u8])]> = parts.chunks((GPU_CHUNK / sub).max(1)).collect();
+    let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |group| {
         let c0 = group[0].0;
         let c1 = group[group.len() - 1].0 + group[group.len() - 1].1.len();
         let w0 = c0 - dict_len(c0);
-        let cpu_turn = arr != 0 && gi % 2 == 1;
-        let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || cpu_turn || c1 - c0 < 2 * PSEG {
+        let step = if arr != 0 || effort(0) == 1 { 4 } else { 2 };
+        let cpu_bytes = dict_len(c0) / step + sub.min(c1 - c0);
+        let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || c1 - c0 < 2 * PSEG || !gpu_turn(c1 - w0, cpu_bytes) {
             None
         } else {
             let skip: Vec<bool> = dense_segments(&data[w0..c1]).iter().enumerate().map(|(i, &f)| f || (i + 1) << SEG_BITS <= c0 - w0).collect();
-            crate::gpu::match_lists(&data[w0..c1], SEG_BITS, &skip).map(|(idx, m)| Lists { start: 0, idx, m })
+            crate::gpu::match_lists(&data[w0..c1], SEG_BITS, &skip)
         };
-        crate::par::map(group, threads, |&(base, p)| code_part(base, p, lists.as_ref().map(|l| l.window(w0, base, dict_len(base), p.len()))))
+        // each sub-block takes its part of the chunk's lists; the buffers then go back
+        let parts: Vec<(usize, &[u8], Option<Lists>)> = match lists {
+            Some(l) => {
+                let w: Vec<Lists> = crate::par::map(group, threads, |&(base, p)| window_of(l.idx(), l.pairs(), 0, w0, base, dict_len(base), p.len()));
+                drop(l);
+                group.iter().zip(w).map(|(&(b, p), w)| (b, p, Some(w))).collect()
+            }
+            None => group.iter().map(|&(b, p)| (b, p, None)).collect(),
+        };
+        let parts: Vec<std::sync::Mutex<Option<Lists>>> = parts.into_iter().map(|t| std::sync::Mutex::new(t.2)).collect();
+        let idx: Vec<usize> = (0..group.len()).collect();
+        crate::par::map(&idx, threads, |&i| {
+            let (base, p) = group[i];
+            code_part(base, p, parts[i].lock().unwrap().take())
+        })
     })
     .into_iter()
     .flatten()

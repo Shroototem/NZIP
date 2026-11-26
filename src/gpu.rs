@@ -54,6 +54,7 @@ api! {
     cuMemGetInfo_v2: fn(*mut usize, *mut usize);
     cuLaunchKernel: fn(*mut c_void, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, *mut c_void, *mut *mut c_void, *mut *mut c_void);
     cuCtxSynchronize: fn();
+    cuMemAllocHost_v2: fn(*mut *mut c_void, usize);
 }
 
 #[cfg(unix)]
@@ -140,6 +141,10 @@ struct Gpu {
     /// device buffers kept between jobs (capacity, pointer): cuMemAlloc / cuMemFree cost
     /// milliseconds each and every free synchronizes the device
     cache: std::cell::RefCell<Vec<(usize, DevPtr)>>,
+    /// Largest total the cache keeps between jobs: most of the VRAM nzip may use, so
+    /// jobs of every size find their buffers there for the whole run (freeing stalls
+    /// the device, allocating costs milliseconds).
+    cache_max: usize,
 }
 
 // The raw handles are only used while holding the global mutex.
@@ -163,7 +168,11 @@ fn lock(m: &'static Mutex<Gpu>) -> std::sync::MutexGuard<'static, Gpu> {
 pub fn warm() {
     if GPU_PCT.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         std::thread::spawn(|| {
-            let _ = gpu();
+            if let Some(m) = gpu() {
+                // host buffers for the first match-list jobs (48 MB: a chunk + history)
+                let g = lock(m);
+                g.prefill(48 << 20);
+            }
         });
     }
 }
@@ -253,7 +262,10 @@ unsafe fn init() -> Result<Gpu, String> {
             mf_count: f("mf_count")?,
             mf_pack: f("mf_pack")?,
         };
-        Ok(Gpu { api, ctx, k, name, disabled: false, cache: std::cell::RefCell::new(Vec::new()) })
+        let (mut free, mut total) = (0usize, 0usize);
+        (api.cuMemGetInfo_v2)(&mut free, &mut total);
+        let cache_max = free / 100 * GPU_PCT.load(std::sync::atomic::Ordering::Relaxed) as usize / 10 * 8;
+        Ok(Gpu { api, ctx, k, name, disabled: false, cache: std::cell::RefCell::new(Vec::new()), cache_max })
     }
 }
 
@@ -290,8 +302,6 @@ impl Drop for Buf<'_> {
     }
 }
 
-/// Largest total the buffer cache keeps (more is freed).
-const CACHE_MAX: usize = 6 << 30;
 
 #[inline(always)]
 fn arg<T>(v: &mut T) -> *mut c_void {
@@ -536,7 +546,7 @@ impl Gpu {
 
     /// LZ match lists for every position of `s` (see mf_find in sa.cu); positions in
     /// segments where `skip(seg)` is set get empty lists.
-    fn match_lists(&self, s: &[u8], seg_bits: u32, skip: &[bool]) -> Result<(Vec<u32>, Vec<(u32, u32)>), String> {
+    fn match_lists(&self, s: &[u8], seg_bits: u32, skip: &[bool]) -> Result<GpuLists, String> {
         const C: usize = 6;
         const W: usize = 1 + 2 * C;
         let n = s.len();
@@ -566,7 +576,14 @@ impl Gpu {
         let g = self.alloc(n * 4)?;
         let bits = 32 - (n32.max(2) - 1).leading_zeros();
         let shifts: Vec<u32> = (0..bits.div_ceil(8)).map(|i| i * 8).collect();
-        for (v, &l) in GRAMS.iter().enumerate() {
+        for (v, &l) in GRAMS.iter().enumerate().rev() {
+            // levels 6 and 12 reuse levels 8 and 16 (the nearest with a longer match): two
+            // sorts fewer for no measurable loss
+            if l == 6 || l == 12 {
+                let src = prev.p + ((v + 1) * n * 4) as u64;
+                unsafe { ck((self.api.cuMemcpyDtoD_v2)(prev.p + (v * n * 4) as u64, src, n * 4), "copy")? };
+                continue;
+            }
             let (mut lp, mut gp, mut l_) = (lcp.p, g.p, l);
             self.launch(self.k.mf_gstart, n32, 256, &mut [arg(&mut lp), arg(&mut np), arg(&mut l_), arg(&mut gp)])?;
             self.scan(g.p, n32, d.sums.p, true, true)?;
@@ -593,9 +610,11 @@ impl Gpu {
         let c8 = self.alloc(chunk)?;
         let packed = self.alloc(chunk * C * 8)?;
         unsafe { ck((self.api.cuMemcpyHtoD_v2)(skipd.p, flags.as_ptr() as *const c_void, flags.len()), "upload")? };
-        let mut idx = Vec::with_capacity(n + 1);
-        let mut m: Vec<(u32, u32)> = Vec::with_capacity(n * 2);
-        let mut cnts = vec![0u8; chunk];
+        // offsets (u32 per position) and pairs go straight into host buffers kept between
+        // jobs; offsets come back exclusive per pass and get the pass's base added here
+        let idx = self.host_buf((n + 1) * 4);
+        let mut m = self.host_buf(n * LIST_BPP.load(Relaxed));
+        let mut base = 0usize;
         let mut p0 = 0usize;
         while p0 < n {
             let cnt = chunk.min(n - p0);
@@ -617,26 +636,34 @@ impl Gpu {
             let (mut op, mut pk) = (offsd.p, packed.p);
             self.launch(self.k.mf_pack, cnt as u32, 256, &mut [arg(&mut outp), arg(&mut op), arg(&mut cp), arg(&mut cnt_), arg(&mut pk)])?;
             lap("find");
-            // counts come back as bytes (offsets are rebuilt here), the pairs straight into
-            // the list's spare capacity
-            let base = m.len();
-            m.reserve(total);
-            unsafe {
-                ck((self.api.cuMemcpyDtoH_v2)(cnts.as_mut_ptr() as *mut c_void, c8.p, cnt), "download")?;
-                ck((self.api.cuMemcpyDtoH_v2)(m.as_mut_ptr().add(base) as *mut c_void, packed.p, total * 8), "download")?;
-                m.set_len(base + total);
+            if (base + total) * 8 > m.cap {
+                // more pairs than this buffer holds: a bigger one, keeping what came so far
+                let bigger = self.host_buf(((base + total) * 8).max(m.cap * 2));
+                unsafe { std::ptr::copy_nonoverlapping(m.p, bigger.p, base * 8) };
+                let old = std::mem::replace(&mut m, bigger);
+                HOST.lock().unwrap().push(old);
             }
-            let mut at = base as u32;
-            idx.extend(cnts[..cnt].iter().map(|&c| {
-                let o = at;
-                at += c as u32;
-                o
-            }));
+            let td = std::time::Instant::now();
+            unsafe {
+                ck((self.api.cuMemcpyDtoH_v2)(idx.p.add(p0 * 4) as *mut c_void, offsd.p, cnt * 4), "download")?;
+                ck((self.api.cuMemcpyDtoH_v2)(m.p.add(base * 8) as *mut c_void, packed.p, total * 8), "download")?;
+            }
+            if trace {
+                eprintln!("    mf copy: {:.0} ms for {} MB", td.elapsed().as_secs_f64() * 1e3, (total * 8 + cnt * 4) >> 20);
+            }
+            let ix = unsafe { std::slice::from_raw_parts_mut(idx.p.add(p0 * 4) as *mut u32, cnt) };
+            for v in ix.iter_mut() {
+                *v += base as u32;
+            }
+            base += total;
             p0 += cnt;
             lap("download");
         }
-        idx.push(m.len() as u32);
-        Ok((idx, m))
+        unsafe { *(idx.p as *mut u32).add(n) = base as u32 };
+        let bpp = (base * 8).div_ceil(n.max(1)) + 1;
+        LIST_BPP.store((LIST_BPP.load(Relaxed) * 3 + bpp) / 4, Relaxed);
+        let _ = c8;
+        Ok(GpuLists { idx, m, n, total: base })
     }
 
     fn bwt(&self, s: &[u8]) -> Result<(Vec<u8>, Vec<u32>), String> {
@@ -691,7 +718,7 @@ fn gpu_bwt(s: &[u8]) -> Option<(Vec<u8>, Vec<u32>)> {
                 unsafe { (g.api.cuCtxSetCurrent)(g.ctx) };
                 if g.free_mem() >= vram_need(s.len()) {
                     let r = g.bwt(s);
-                    g.trim(CACHE_MAX);
+                    g.trim(g.cache_max);
                     match r {
                         Ok(r) => return Some(r),
                         Err(e) => {
@@ -710,23 +737,45 @@ fn gpu_bwt(s: &[u8]) -> Option<(Vec<u8>, Vec<u32>)> {
 /// LZ match lists for every position of `s` from the GPU (a suffix array and its
 /// nearest neighbours), or None when no GPU can take it. Index `p` covers
 /// `m[idx[p]..idx[p + 1]]`, pairs (len, dist - 1) with increasing length.
-pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, Vec<(u32, u32)>)> {
+pub fn match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<GpuLists> {
     if s.len() < GPU_MIN || s.len() >= (u32::MAX as usize >> 1) {
+        QUEUED.fetch_sub(s.len() as u64, Relaxed);
         return None;
     }
     // the GPU job runs without a CPU token (taken back once the GPU is released)
     crate::par::idle(|| gpu_match_lists(s, seg_bits, skip))
 }
 
-fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, Vec<(u32, u32)>)> {
+/// `match_lists` for a thread that holds no CPU token (a match finder helper thread).
+pub fn match_lists_helper(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<GpuLists> {
+    if s.len() < GPU_MIN || s.len() >= (u32::MAX as usize >> 1) {
+        QUEUED.fetch_sub(s.len() as u64, Relaxed);
+        return None;
+    }
+    gpu_match_lists(s, seg_bits, skip)
+}
+
+/// The GPU will soon run out of match-list work: at most one job is reserved or running,
+/// so a new one would start right after it (the GPU never waits for the next job).
+pub fn mf_idle() -> bool {
+    QUEUED.load(Relaxed) <= 48 << 20
+}
+
+fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<GpuLists> {
+    // this job's reservation (mf_reserve) ends with it, whatever happens
+    struct Out(u64);
+    impl Drop for Out {
+        fn drop(&mut self) {
+            QUEUED.fetch_sub(self.0, Relaxed);
+        }
+    }
+    let _out = Out(s.len() as u64);
     let Some(m) = gpu() else {
         if crate::sys::dev_flag("NZIP_TRACE") {
             eprintln!("  gpu match lists: no GPU ({})", GPU_ERR.get().map_or("off", |e| e.as_str()));
         }
         return None;
     };
-    // a busy GPU is waited for: its lists beat the CPU match finder on time and size, and
-    // which pieces get them then does not depend on timing (same archive every run)
     let mut g = lock(m);
     if g.disabled {
         return None;
@@ -740,7 +789,11 @@ fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
     }
     let t0 = std::time::Instant::now();
     let r = g.match_lists(s, seg_bits, skip);
-    g.trim(CACHE_MAX);
+    g.trim(g.cache_max);
+    // GPU time per input byte, as a running average
+    let ps = (t0.elapsed().as_nanos() as u64 * 1000 / s.len().max(1) as u64).max(1);
+    let old = JOB_PS.load(Relaxed);
+    JOB_PS.store(if old == 0 { ps } else { (old * 3 + ps) / 4 }, Relaxed);
     match r {
         Ok(r) => {
             if crate::sys::dev_flag("NZIP_TRACE") {
@@ -751,9 +804,119 @@ fn gpu_match_lists(s: &[u8], seg_bits: u32, skip: &[bool]) -> Option<(Vec<u32>, 
         Err(e) => {
             eprintln!("nzip: GPU disabled for this run ({e}); using the CPU");
             g.disabled = true;
+            DISABLED.store(true, Relaxed);
             None
         }
     }
+}
+
+use std::sync::atomic::Ordering::Relaxed;
+
+/// Host buffer for match lists: page-locked when the driver allows (the GPU writes into
+/// it directly at full bus speed), kept for the whole run and reused by later jobs, so no
+/// job waits on page faults while it holds the GPU.
+struct HostBuf {
+    p: *mut u8,
+    cap: usize,
+}
+
+unsafe impl Send for HostBuf {}
+unsafe impl Sync for HostBuf {}
+
+static HOST: Mutex<Vec<HostBuf>> = Mutex::new(Vec::new());
+
+/// Page-locked bytes held by the pool (capped at 1/16 of the RAM budget: page-locked
+/// memory cannot be swapped and the rest of the machine needs it too).
+static PINNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Running average of match-list bytes per position (sizes new buffers).
+static LIST_BPP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+impl Gpu {
+    /// A host buffer of at least `bytes` (the smallest one in the pool that fits).
+    fn host_buf(&self, bytes: usize) -> HostBuf {
+        {
+            let mut pool = HOST.lock().unwrap();
+            if let Some(i) = (0..pool.len()).filter(|&i| pool[i].cap >= bytes).min_by_key(|&i| pool[i].cap) {
+                return pool.swap_remove(i);
+            }
+        }
+        // generous rounding: later jobs of similar size then find it in the pool
+        let cap = (bytes + bytes / 4).max(1 << 20).next_multiple_of(128 << 20);
+        let mut p: *mut c_void = std::ptr::null_mut();
+        let room = (crate::sys::mem_budget() / 16) as usize;
+        if PINNED.load(Relaxed) + cap <= room && unsafe { (self.api.cuMemAllocHost_v2)(&mut p, cap) } == 0 && !p.is_null() {
+            PINNED.fetch_add(cap, Relaxed);
+        } else {
+            // ordinary memory (the driver copies through its own staging buffer); it is
+            // kept too, so its pages are mapped once
+            p = Box::into_raw(vec![0u8; cap].into_boxed_slice()) as *mut c_void;
+        }
+        HostBuf { p: p as *mut u8, cap }
+    }
+
+    /// Fills the pool with buffers for two jobs of `n` positions (run in the background
+    /// when the GPU starts, so no job waits for them).
+    fn prefill(&self, n: usize) {
+        let bufs: Vec<HostBuf> = (0..2).flat_map(|_| [self.host_buf((n + 1) * 4), self.host_buf(n * LIST_BPP.load(Relaxed))]).collect();
+        HOST.lock().unwrap().extend(bufs);
+    }
+}
+
+/// Match lists found on the GPU: per position `idx[p]..idx[p + 1]` indexes the
+/// (len, dist - 1) pairs. The buffers go back to the pool when this is dropped.
+pub struct GpuLists {
+    idx: HostBuf,
+    m: HostBuf,
+    n: usize,
+    total: usize,
+}
+
+impl GpuLists {
+    pub fn idx(&self) -> &[u32] {
+        unsafe { std::slice::from_raw_parts(self.idx.p as *const u32, self.n + 1) }
+    }
+    pub fn pairs(&self) -> &[(u32, u32)] {
+        unsafe { std::slice::from_raw_parts(self.m.p as *const (u32, u32), self.total) }
+    }
+}
+
+impl Drop for GpuLists {
+    fn drop(&mut self) {
+        let mut pool = HOST.lock().unwrap();
+        pool.push(HostBuf { p: self.idx.p, cap: self.idx.cap });
+        pool.push(HostBuf { p: self.m.p, cap: self.m.cap });
+    }
+}
+
+/// Bytes of match-list jobs reserved for the GPU and not finished yet.
+static QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Running average of GPU match-list time per input byte, in picoseconds (0 = none yet).
+static JOB_PS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reserves the GPU for match lists of `bytes` if they would arrive before `cpu_ps` (what
+/// the CPU match finder is expected to take), counting every job reserved ahead of this
+/// one. A reserved job must then be run with `match_lists`. Before any job has finished,
+/// a typical figure (25 ns per byte) stands in for the GPU's speed.
+pub fn mf_reserve(bytes: usize, cpu_ps: u64) -> bool {
+    if GPU_PCT.load(Relaxed) == 0 || DISABLED.load(Relaxed) || bytes < GPU_MIN || bytes >= (u32::MAX as usize >> 1) || gpu().is_none() {
+        return false;
+    }
+    static PICK: Mutex<()> = Mutex::new(());
+    let _one = PICK.lock().unwrap();
+    let per = match JOB_PS.load(Relaxed) {
+        0 => 25_000,
+        p => p,
+    };
+    let wait = (QUEUED.load(Relaxed) + bytes as u64) * per;
+    if crate::sys::dev_flag("NZIP_TRACE") {
+        eprintln!("  mf choice: gpu wait {} ms vs cpu {} ms", wait / 1_000_000_000, cpu_ps / 1_000_000_000);
+    }
+    if wait > cpu_ps {
+        return false;
+    }
+    QUEUED.fetch_add(bytes as u64, Relaxed);
+    true
 }
 
 /// Smallest inverse BWT worth the GPU (driver start-up, transfers).
