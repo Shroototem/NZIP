@@ -66,8 +66,21 @@ fn crc_tables() -> &'static [[u32; 256]; 8] {
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
+    !crc_update(!0, data)
+}
+
+/// Runs the CRC register `c` over `data`: carry-less multiply folding where the CPU
+/// has it (many times faster), else slicing by 8. Both give the same value.
+fn crc_update(c: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if data.len() >= 128 && has_clmul() {
+        return unsafe { crc_clmul(c, data) };
+    }
+    crc_sw(c, data)
+}
+
+fn crc_sw(mut c: u32, data: &[u8]) -> u32 {
     let t = crc_tables();
-    let mut c = !0u32;
     let mut chunks = data.chunks_exact(8);
     for ch in &mut chunks {
         let a = u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]) ^ c;
@@ -84,7 +97,70 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &b in chunks.remainder() {
         c = t[0][((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
     }
-    !c
+    c
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_clmul() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| std::arch::is_x86_feature_detected!("pclmulqdq") && std::arch::is_x86_feature_detected!("sse4.1"))
+}
+
+/// CRC-32 by folding 128-bit lanes with carry-less multiplies (Intel's "Fast CRC
+/// Computation for Generic Polynomials Using PCLMULQDQ", bit-reflected form), then a
+/// Barrett reduction; the tail (< 16 bytes) goes through `crc_sw`. Needs >= 64 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
+unsafe fn crc_clmul(c: u32, mut data: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+    const K1: i64 = 0x1_5444_2bd4;
+    const K2: i64 = 0x1_c6e4_1596;
+    const K3: i64 = 0x1_7519_97d0;
+    const K4: i64 = 0x0_ccaa_009e;
+    const K5: i64 = 0x1_63cd_6124;
+    const P: i64 = 0x1_DB71_0641;
+    const U: i64 = 0x1_F701_1641;
+    #[inline(always)]
+    unsafe fn get(d: &mut &[u8]) -> __m128i {
+        let r = unsafe { _mm_loadu_si128(d.as_ptr() as *const __m128i) };
+        *d = &d[16..];
+        r
+    }
+    #[inline(always)]
+    unsafe fn fold(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
+        unsafe { _mm_xor_si128(_mm_xor_si128(b, _mm_clmulepi64_si128(a, k, 0x00)), _mm_clmulepi64_si128(a, k, 0x11)) }
+    }
+    unsafe {
+        let mut x3 = get(&mut data);
+        let mut x2 = get(&mut data);
+        let mut x1 = get(&mut data);
+        let mut x0 = get(&mut data);
+        x3 = _mm_xor_si128(x3, _mm_cvtsi32_si128(c as i32));
+        let k12 = _mm_set_epi64x(K2, K1);
+        while data.len() >= 64 {
+            x3 = fold(x3, get(&mut data), k12);
+            x2 = fold(x2, get(&mut data), k12);
+            x1 = fold(x1, get(&mut data), k12);
+            x0 = fold(x0, get(&mut data), k12);
+        }
+        let k34 = _mm_set_epi64x(K4, K3);
+        let mut x = fold(x3, x2, k34);
+        x = fold(x, x1, k34);
+        x = fold(x, x0, k34);
+        while data.len() >= 16 {
+            x = fold(x, get(&mut data), k34);
+        }
+        // 128 -> 64 bits
+        let lo32 = _mm_set_epi32(0, 0, 0, !0);
+        let x = _mm_xor_si128(_mm_clmulepi64_si128(x, k34, 0x10), _mm_srli_si128(x, 8));
+        let x = _mm_xor_si128(_mm_clmulepi64_si128(_mm_and_si128(x, lo32), _mm_set_epi64x(0, K5), 0x00), _mm_srli_si128(x, 4));
+        // Barrett reduction 64 -> 32 bits
+        let pu = _mm_set_epi64x(U, P);
+        let t1 = _mm_clmulepi64_si128(_mm_and_si128(x, lo32), pu, 0x10);
+        let t2 = _mm_clmulepi64_si128(_mm_and_si128(t1, lo32), pu, 0x00);
+        let r = _mm_extract_epi32(_mm_xor_si128(x, t2), 1) as u32;
+        crc_sw(r, data)
+    }
 }
 
 /// CRC-32 of A||B from crc(A), crc(B) and len(B) (zlib's crc32_combine: multiply by
@@ -168,6 +244,14 @@ mod tests {
         assert_eq!(crc32_par(&v, 8), crc32(&v));
         let (a, b) = v.split_at(12345);
         assert_eq!(crc32_combine(crc32(a), crc32(b), b.len() as u64), crc32(&v));
+    }
+
+    #[test]
+    fn crc_hw_matches_table() {
+        let v: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        for len in (0..300).chain([1000, 4095, 4096, 4097, 65_537, 100_000]) {
+            assert_eq!(!crc_update(!0, &v[..len]), !crc_sw(!0, &v[..len]), "len {len}");
+        }
     }
 
     #[test]

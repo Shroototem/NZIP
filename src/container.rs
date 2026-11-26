@@ -22,7 +22,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 9;
+pub const VERSION: u8 = 10;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
