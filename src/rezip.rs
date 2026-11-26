@@ -10,13 +10,28 @@ use crate::mix::{BIN, Piece, TEXT};
 
 /// One rebuilt stream: `gap` unchanged bytes since the previous one, then a deflate
 /// stream of `comp` bytes that inflates to `raw` bytes and deflates back with `params`
-/// (level | memLevel << 4).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// (level | memLevel << 4). `splits`: clean block boundaries (stream offset, output bit
+/// offset) where the decoder cuts the rebuild into pieces that run in parallel.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Rec {
     pub gap: usize,
     pub raw: usize,
     pub comp: usize,
     pub params: u8,
+    pub splits: Vec<(usize, u64)>,
+}
+
+/// Streams at least this big (inflated) get split points.
+const SPLIT_MIN: usize = 2 << 20;
+
+/// Inflated bytes per rebuild piece: about the same rebuild time at every level (level 9
+/// walks hash chains up to 4096 long).
+fn seg_len(level: u8) -> usize {
+    match level {
+        8.. => 1 << 20,
+        7 => 2 << 20,
+        _ => 3 << 20,
+    }
 }
 
 /// Levels / memLevels to try, most common first (Java and most zip tools use 6 / 8).
@@ -93,9 +108,87 @@ fn candidates(b: &[u8]) -> Vec<Cand> {
     out
 }
 
-/// The levels that rebuild `comp` from `raw`, or None.
-fn find_params(raw: &[u8], comp: &[u8]) -> Option<u8> {
-    TRIES.iter().find(|&&(l, m)| crate::zlib::deflate_eq(raw, l, m, comp)).map(|&(l, m)| l | (m << 4))
+/// The levels that rebuild `comp` from `raw` and the split points of the rebuild, or None.
+fn find_params(raw: &[u8], comp: &[u8], threads: usize) -> Option<(u8, Vec<(usize, u64)>)> {
+    if raw.len() < SPLIT_MIN || crate::sys::dev_flag("NZ_NOSPLIT") {
+        return TRIES.iter().find(|&&(l, m)| crate::zlib::deflate_eq(raw, l, m, comp)).map(|&(l, m)| (l | (m << 4), Vec::new()));
+    }
+    // big streams: the run that matches also lists the clean block boundaries
+    for &(l, m) in &TRIES {
+        let pts = if l >= 4 {
+            crate::zlib::deflate_points(raw, l, m, comp)
+        } else {
+            crate::zlib::deflate_eq(raw, l, m, comp).then(Vec::new)
+        };
+        if let Some(pts) = pts {
+            if crate::sys::dev_flag("NZ_RZT") && pts.is_empty() {
+                eprintln!("  splits: {} KB level {l}: no clean boundary", raw.len() >> 10);
+            }
+            return Some((l | (m << 4), splits_of(raw, comp, l, m, &pts, threads)));
+        }
+    }
+    None
+}
+
+/// Split points every `seg_len` bytes or so, kept only if the pieces rebuilt apart give
+/// `comp` back exactly.
+fn splits_of(raw: &[u8], comp: &[u8], l: u8, m: u8, pts: &[(usize, u64)], threads: usize) -> Vec<(usize, u64)> {
+    let step = seg_len(l);
+    let mut cuts = Vec::new();
+    let mut last = 0usize;
+    for &(at, bit) in pts {
+        if at >= last + step && raw.len() - at >= step / 2 {
+            cuts.push((at, bit));
+            last = at;
+        }
+    }
+    if cuts.is_empty() {
+        return cuts;
+    }
+    let rec = Rec { gap: 0, raw: raw.len(), comp: comp.len(), params: l | (m << 4), splits: cuts };
+    let ok = rebuild(raw, &rec, threads).is_some_and(|c| c == comp);
+    if crate::sys::dev_flag("NZ_RZT") {
+        eprintln!("  splits: {} KB level {l}: {} boundaries, {} cuts, verified {ok}", raw.len() >> 10, pts.len(), rec.splits.len());
+    }
+    if ok { rec.splits } else { Vec::new() }
+}
+
+/// Pieces of one stream's rebuild: (start, stop, lead bits).
+fn pieces_of(r: &Rec) -> Vec<(usize, Option<usize>, u32)> {
+    let mut v = Vec::with_capacity(r.splits.len() + 1);
+    let (mut start, mut lead) = (0usize, 0u32);
+    for &(at, bit) in &r.splits {
+        v.push((start, Some(at), lead));
+        start = at;
+        lead = (bit & 7) as u32;
+    }
+    v.push((start, None, lead));
+    v
+}
+
+/// Joins the pieces of one stream (in order).
+fn join(parts: impl Iterator<Item = Option<(Vec<u8>, u64)>>, cap: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(cap);
+    let mut len = 0u64;
+    for p in parts {
+        let (seg, bits) = p?;
+        if bits < len & 7 || bits.div_ceil(8) as usize > seg.len() {
+            return None;
+        }
+        crate::zlib::append_bits(&mut out, &mut len, &seg, bits);
+    }
+    Some(out)
+}
+
+/// Deflates one stream again from its inflated bytes, its pieces in parallel.
+fn rebuild(raw: &[u8], r: &Rec, threads: usize) -> Option<Vec<u8>> {
+    let (l, m) = (r.params & 15, r.params >> 4);
+    if r.splits.is_empty() {
+        return Some(crate::zlib::deflate(raw, l, m));
+    }
+    let pieces = pieces_of(r);
+    let parts = crate::par::map(&pieces, threads, |&(s, t, lead)| crate::zlib::deflate_seg(raw, l, m, s, t, lead));
+    join(parts.into_iter(), r.comp)
 }
 
 /// Text test for an inflated entry (same rule as the zip split).
@@ -156,8 +249,8 @@ pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
         return None;
     }
     // which ones zlib rebuilds, and how
-    let params: Vec<Option<(u8, bool)>> =
-        crate::par::map(&picks, threads, |(s, used, raw)| find_params(raw, &b[*s..*s + *used]).map(|p| (p, is_text(raw))));
+    let params: Vec<Option<(u8, Vec<(usize, u64)>, bool)>> =
+        crate::par::map(&picks, threads, |(s, used, raw)| find_params(raw, &b[*s..*s + *used], threads).map(|(p, sp)| (p, sp, is_text(raw))));
     lap("verify");
     let mut out = Vec::with_capacity(b.len() * 2);
     let mut recs = Vec::new();
@@ -174,7 +267,7 @@ pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
     let mut at = 0;
     let mut gained = 0usize;
     for ((s, used, raw), p) in picks.iter().zip(params) {
-        let Some((p, text)) = p else { continue };
+        let Some((p, splits, text)) = p else { continue };
         if out.len() + (s - at) + raw.len() + (b.len() - s) > limit {
             break;
         }
@@ -182,7 +275,7 @@ pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
         push(&mut pieces, s - at, BIN);
         out.extend_from_slice(raw);
         push(&mut pieces, raw.len(), if text { TEXT } else { BIN });
-        recs.push(Rec { gap: s - at, raw: raw.len(), comp: *used, params: p });
+        recs.push(Rec { gap: s - at, raw: raw.len(), comp: *used, params: p, splits });
         gained += used;
         at = s + used;
     }
@@ -204,6 +297,13 @@ pub fn write_recs(recs: &[Rec]) -> Vec<u8> {
         write_varint(&mut w, r.raw as u64);
         write_varint(&mut w, r.comp as u64);
         w.push(r.params);
+        write_varint(&mut w, r.splits.len() as u64);
+        let (mut at, mut bit) = (0usize, 0u64);
+        for &(a, b) in &r.splits {
+            write_varint(&mut w, (a - at) as u64);
+            write_varint(&mut w, b - bit);
+            (at, bit) = (a, b);
+        }
     }
     w
 }
@@ -227,7 +327,24 @@ pub fn read_recs(r: &mut &[u8], raw_len: usize) -> Result<Vec<Rec>, String> {
         if total > raw_len || !(1..=9).contains(&l) || !(1..=9).contains(&m) {
             return Err(e());
         }
-        out.push(Rec { gap, raw, comp, params });
+        // split points: strictly inside the stream, in order, levels 4..=9 only
+        let ns = read_varint(r).map_err(|_| e())? as usize;
+        if ns > raw / (1 << 16) || (ns > 0 && l < 4) {
+            return Err(e());
+        }
+        let mut splits = Vec::with_capacity(ns);
+        let (mut at, mut bit) = (0usize, 0u64);
+        for _ in 0..ns {
+            let da = read_varint(r).map_err(|_| e())? as usize;
+            let db = read_varint(r).map_err(|_| e())?;
+            at = at.checked_add(da).ok_or_else(e)?;
+            bit = bit.checked_add(db).ok_or_else(e)?;
+            if da == 0 || db == 0 || at >= raw || bit >= comp as u64 * 8 {
+                return Err(e());
+            }
+            splits.push((at, bit));
+        }
+        out.push(Rec { gap, raw, comp, params, splits });
     }
     Ok(out)
 }
@@ -247,8 +364,30 @@ pub fn restore(data: &[u8], recs: &[Rec], raw_len: usize, threads: usize) -> Res
         spans.push((at, end, r.params));
         at = end;
     }
-    // biggest streams first (they share one queue with the other blocks' work)
-    let comp: Vec<Vec<u8>> = crate::par::map_ranked(&spans, threads, |&(s, t, _)| (t - s) as u64, |&(s, t, p)| crate::zlib::deflate(&data[s..t], p & 15, p >> 4));
+    // every stream's rebuild pieces, costliest first (they share one queue with the other
+    // blocks' work); level 7+ walks long hash chains
+    let mut jobs = Vec::new();
+    for (k, (r, &(s, t, _))) in recs.iter().zip(&spans).enumerate() {
+        for (a, b, lead) in pieces_of(r) {
+            jobs.push((k, s, t, a, b, lead));
+        }
+    }
+    let cost = |j: &(usize, usize, usize, usize, Option<usize>, u32)| {
+        let (s, t) = (j.1, j.2);
+        let len = j.4.unwrap_or(t - s) - j.3;
+        len as u64 * if recs[j.0].params & 15 >= 7 { 4 } else { 1 }
+    };
+    let parts = crate::par::map_ranked(&jobs, threads, cost, |&(k, s, t, a, b, lead)| {
+        let r = &recs[k];
+        let (l, m) = (r.params & 15, r.params >> 4);
+        if r.splits.is_empty() { Some((crate::zlib::deflate(&data[s..t], l, m), r.comp as u64 * 8)) } else { crate::zlib::deflate_seg(&data[s..t], l, m, a, b, lead) }
+    });
+    let mut parts = parts.into_iter();
+    let mut comp: Vec<Vec<u8>> = Vec::with_capacity(recs.len());
+    for r in recs {
+        let n = r.splits.len() + 1;
+        comp.push(join(parts.by_ref().take(n), r.comp).ok_or_else(e)?);
+    }
     let mut out = Vec::with_capacity(raw_len);
     let mut at = 0;
     for ((r, &(s, t, _)), c) in recs.iter().zip(&spans).zip(&comp) {

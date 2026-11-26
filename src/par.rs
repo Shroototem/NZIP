@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 /// The calling thread of a `map` always works (it already holds a token: the main thread's
 /// own, or the one it took as a helper); helpers take a token per item and give it back
 /// after, so nested maps share the cores and none can deadlock.
-static FREE: AtomicIsize = AtomicIsize::new(isize::MAX);
+/// Unlimited until `set_threads` (half of isize::MAX, so tokens handed back never overflow).
+static FREE: AtomicIsize = AtomicIsize::new(isize::MAX / 2);
 
 /// Caps the number of threads working at once (the main thread counts as one).
 pub fn set_threads(n: usize) {
@@ -98,6 +99,36 @@ fn drain(next: &AtomicUsize, n: usize, helper: bool, mut work: impl FnMut(usize)
             return;
         }
     }
+}
+
+/// Runs `f` on every item at once, one thread each, without taking CPU tokens: for a few
+/// items that mostly hand their work to `map_ranked` (decode stages), so that work joins
+/// the shared queue right away instead of waiting for a token to start. A caller holding
+/// a token lends it while it waits. Results in input order.
+pub fn fan<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    let had = held();
+    if had {
+        give();
+        set_held(false);
+    }
+    let f = &f;
+    let out = std::thread::scope(|s| {
+        let hs: Vec<_> = items
+            .iter()
+            .map(|it| {
+                s.spawn(move || {
+                    set_held(false);
+                    f(it)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    if had {
+        wait_token();
+        set_held(true);
+    }
+    out
 }
 
 /// Run `f` over `items` on up to `threads` threads; results in input order.

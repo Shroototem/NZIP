@@ -22,7 +22,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 8;
+pub const VERSION: u8 = 9;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -350,7 +350,7 @@ fn unpack_rezip(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Str
         parts.push((kind, len, r.get(..c).ok_or_else(e)?));
         r = &r[c..];
     }
-    let out = par::map(&parts, n, |&(kind, len, c)| unpack_payload(kind, c, len, threads));
+    let out = par::fan(&parts, |&(kind, len, c)| unpack_payload(kind, c, len, threads));
     let mut data = Vec::with_capacity(total);
     for (p, &(_, len, _)) in out.into_iter().zip(&parts) {
         let p = p?;
@@ -401,7 +401,7 @@ fn unpack_mix(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
         parts.push((kind, n, r.get(..c).ok_or_else(e)?));
         r = &r[c..];
     }
-    let out = par::map(&parts, 3, |&(kind, n, c)| unpack_payload(kind, c, n, threads)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let out = par::fan(&parts, |&(kind, n, c)| unpack_payload(kind, c, n, threads)).into_iter().collect::<Result<Vec<_>, _>>()?;
     crate::mix::scatter(&out, &pieces)
 }
 
@@ -522,7 +522,7 @@ fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String
         off += comp[i];
     }
     trace("lz streams start", raw_len);
-    let streams = par::map(&jobs, 4, |&(c, n)| crate::lzx::decode(c, n, threads, false)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let streams = par::fan(&jobs, |&(c, n)| crate::lzx::decode(c, n, threads, false)).into_iter().collect::<Result<Vec<_>, _>>()?;
     trace("lz streams done", raw_len);
     let j = crate::x86::join_chunks([&streams[0], &streams[1], &streams[2], &streams[3]], &lens, raw_len, threads);
     trace("x86 join done", raw_len);

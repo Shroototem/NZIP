@@ -101,11 +101,8 @@ pub struct MixV<const K: usize> {
 const WMAX: i32 = 130_000;
 
 impl<const K: usize> MixV<K> {
-    pub fn new(rows: usize, lr: i32, inputs: usize) -> Self {
-        let mut init = [0i32; K];
-        for v in init.iter_mut().take(inputs) {
-            *v = (16384 / inputs as i32) * 2;
-        }
+    /// Every row starts with the weights `init`.
+    pub fn with_init(rows: usize, lr: i32, init: [i32; K]) -> Self {
         MixV { w: vec![init; rows], x: [0; K], row: 0, pr: 2048, lr }
     }
 

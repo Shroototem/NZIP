@@ -422,6 +422,13 @@ struct State<'a> {
     target: Option<&'a [u8]>,
     checked: usize,
     bad: bool,
+    /// stream offset of `input[0]` (a segment starts with up to WSIZE bytes of history)
+    base: usize,
+    /// when recording: every clean block boundary as (stream offset, output bit offset)
+    points: Option<Vec<(usize, u64)>>,
+    /// stop at the clean block boundary at this stream offset (usize::MAX: never)
+    stop: usize,
+    stopped: bool,
 }
 
 const WINDOW_SIZE: usize = 2 * WSIZE;
@@ -506,16 +513,52 @@ impl<'a> State<'a> {
             target: None,
             checked: 0,
             bad: false,
+            base: 0,
+            points: None,
+            stop: usize::MAX,
+            stopped: false,
         };
         s.init_block();
         s
     }
 
+    /// A compressor that starts at stream offset `start` of `data` at a clean block
+    /// boundary (see `deflate_points`): the WSIZE bytes before it are loaded the way
+    /// deflateSetDictionary loads a dictionary, which leaves the window, hash chains and
+    /// block state as a run from the stream start has them there.
+    fn new_at(data: &'a [u8], start: usize, level: usize, mem: usize) -> State<'a> {
+        let h = start.min(WSIZE);
+        let mut s = State::new(&data[start - h..], level, mem);
+        s.base = start - h;
+        s.window[..h].copy_from_slice(&data[start - h..start]);
+        s.strstart = h;
+        s.block_start = h as i64;
+        s.in_pos = h;
+        s.insert = h;
+        s
+    }
+
+    /// Stream offset of `strstart`.
+    #[inline(always)]
+    fn at(&self) -> usize {
+        self.base + self.in_pos - self.lookahead
+    }
+
     /// Returns the output and hands the buffers back to this thread's scratch.
     fn finish(self) -> (Vec<u8>, bool) {
-        let State { window, prev, head, sym, ltree, dtree, bltree, b, bits, bad, .. } = self;
+        let (out, _, bad) = self.finish_bits();
+        (out, bad)
+    }
+
+    /// The output with any bits not yet written (zero-padded to a byte), its length in
+    /// bits, and the mismatch flag.
+    fn finish_bits(self) -> (Vec<u8>, u64, bool) {
+        let State { window, prev, head, sym, ltree, dtree, bltree, b, mut bits, bad, .. } = self;
         put_scratch(Box::new(Scratch { window, prev, head, sym, ltree, dtree, bltree, b }));
-        (bits.out, bad)
+        let nbits = bits.out.len() as u64 * 8 + bits.n as u64;
+        let tail = bits.acc.to_le_bytes();
+        bits.out.extend_from_slice(&tail[..bits.n.div_ceil(8) as usize]);
+        (bits.out, nbits, bad)
     }
 
     fn init_block(&mut self) {
@@ -964,6 +1007,16 @@ impl<'a> State<'a> {
                     if self.bad {
                         return;
                     }
+                    // a clean boundary: no pending lazy match, so the next block depends
+                    // only on the WSIZE bytes before it
+                    let at = self.at();
+                    if let Some(p) = self.points.as_mut() {
+                        p.push((at, self.bits.out.len() as u64 * 8 + self.bits.n as u64));
+                    }
+                    if at == self.stop {
+                        self.stopped = true;
+                        return;
+                    }
                 }
             } else if self.match_available {
                 let bflush = self.tally_lit(self.window[self.strstart - 1]);
@@ -1016,6 +1069,56 @@ pub fn deflate_eq(data: &[u8], level: u8, mem: u8, target: &[u8]) -> bool {
     }
     let (out, bad) = s.finish();
     !bad && out == target
+}
+
+/// Like `deflate_eq` (levels 4..=9), also returning the stream's clean block boundaries
+/// (stream offset, output bit offset): points where `deflate_seg` can start or stop.
+pub fn deflate_points(data: &[u8], level: u8, mem: u8, target: &[u8]) -> Option<Vec<(usize, u64)>> {
+    let (level, mem) = (level.clamp(4, 9) as usize, mem.clamp(1, 9) as usize);
+    let mut s = State::new(data, level, mem);
+    s.target = Some(target);
+    s.points = Some(Vec::new());
+    s.deflate_slow();
+    let pts = s.points.take().unwrap_or_default();
+    let (out, bad) = s.finish();
+    (!bad && out == target).then_some(pts)
+}
+
+/// The part of `deflate(data, level, mem)` (levels 4..=9) from the clean boundary at
+/// stream offset `start` (0 = the stream start) to the one at `stop` (None = the end),
+/// written after `lead` (< 8) zero bits so its bytes line up with the whole stream's (the
+/// boundary's bit offset mod 8): its bytes, zero-padded, and its length in bits counting
+/// the lead. None if `stop` is not a boundary.
+pub fn deflate_seg(data: &[u8], level: u8, mem: u8, start: usize, stop: Option<usize>, lead: u32) -> Option<(Vec<u8>, u64)> {
+    let (level, mem) = (level.clamp(4, 9) as usize, mem.clamp(1, 9) as usize);
+    if start > data.len() || lead >= 8 {
+        return None;
+    }
+    let mut s = State::new_at(data, start, level, mem);
+    s.bits.n = lead;
+    s.stop = stop.unwrap_or(usize::MAX);
+    s.deflate_slow();
+    if stop.is_some() != s.stopped {
+        return None;
+    }
+    let (out, nbits, _) = s.finish_bits();
+    Some((out, nbits))
+}
+
+/// Appends a segment from `deflate_seg` (written with lead = `*len` mod 8, `bits` bits
+/// counting the lead) to the bit stream of `*len` bits in `out`.
+pub fn append_bits(out: &mut Vec<u8>, len: &mut u64, seg: &[u8], bits: u64) {
+    let lead = *len & 7;
+    let seg = &seg[..bits.div_ceil(8) as usize];
+    out.truncate(len.div_ceil(8) as usize);
+    if lead == 0 {
+        out.extend_from_slice(seg);
+    } else if let Some((&first, rest)) = seg.split_first() {
+        *out.last_mut().unwrap() |= first;
+        out.extend_from_slice(rest);
+    }
+    *len += bits - lead;
+    out.truncate(len.div_ceil(8) as usize);
 }
 
 // ---------------------------------------------------------------- inflate
@@ -1280,6 +1383,53 @@ pub fn inflate(src: &[u8], limit: usize) -> Option<(Vec<u8>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segments_rebuild_the_stream() {
+        // repetitive text with noise: many blocks, long hash chains
+        let mut x = 7u64;
+        let data: Vec<u8> = (0..3_000_000u32)
+            .flat_map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x % 5 == 0 { vec![(x >> 8) as u8] } else { format!("w{} ", (i * 7 + (x as u32 % 300)) % 911).into_bytes() }
+            })
+            .collect();
+        for level in [4u8, 6, 9] {
+            let full = deflate(&data, level, 8);
+            let pts = deflate_points(&data, level, 8, &full).expect("points");
+            assert!(pts.len() > 4, "level {level}: {} points", pts.len());
+            let cuts: Vec<(usize, u64)> = pts.iter().step_by(pts.len() / 4).copied().collect();
+            let mut out = Vec::new();
+            let mut len = 0u64;
+            let mut start = 0;
+            for k in 0..=cuts.len() {
+                let stop = cuts.get(k).map(|c| c.0);
+                let (seg, bits) = deflate_seg(&data, level, 8, start, stop, (len & 7) as u32).expect("segment");
+                if let Some(c) = cuts.get(k) {
+                    assert_eq!(len + bits - (len & 7), c.1, "level {level} segment {k} length");
+                }
+                append_bits(&mut out, &mut len, &seg, bits);
+                start = stop.unwrap_or(0);
+            }
+            assert_eq!(len, full.len() as u64 * 8);
+            assert!(out == full, "level {level}: rebuilt stream differs");
+        }
+    }
+
+    /// Writes NZ_FILE as a gzip member at level 9 to NZ_OUT (test input for rezip):
+    /// `NZ_FILE=in NZ_OUT=out.gz cargo test --release write_gzip9 -- --ignored`
+    #[test]
+    #[ignore]
+    fn write_gzip9() {
+        let data = std::fs::read(std::env::var("NZ_FILE").unwrap()).unwrap();
+        let mut out = vec![0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 2, 3];
+        out.extend_from_slice(&deflate(&data, 9, 8));
+        out.extend_from_slice(&crate::codec::crc32(&data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        std::fs::write(std::env::var("NZ_OUT").unwrap(), out).unwrap();
+    }
 
     #[test]
     fn deflate_inflate_round_trip() {

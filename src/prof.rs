@@ -62,9 +62,11 @@ pub fn dump() {
         .unwrap_or(0);
     let n = N.load(Ordering::Relaxed).min(CAP);
     let mut s = String::with_capacity(n * 10);
+    s.push_str(&format!("#dump {:x} {:x}\n", dump as *const () as usize, base));
     for v in SAMPLES.iter().take(n) {
         let r = v.load(Ordering::Relaxed);
         s.push_str(&format!("{:x}\n", r.wrapping_sub(base)));
     }
-    let _ = std::fs::write(path, s);
+    let _ = std::fs::write(&path, s);
+    let _ = std::fs::write(format!("{path}.maps"), &maps);
 }

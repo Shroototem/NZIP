@@ -162,8 +162,14 @@ fn piece_cuts(data: &[u8], sub: usize, threads: usize) -> Vec<usize> {
         let ideal = n as f64 / sub as f64 * own / dens;
         let (lo, hi) = (n.div_ceil(SUB_BLOCK).max(1), n.div_ceil(sub).max(1));
         let k = ((g.2 + ideal + 0.2).floor() as i64 - g.3 as i64).clamp(lo as i64, hi as i64) as usize;
+        // pieces saved earlier come only out of blocks at or below the average density:
+        // a denser block sets the decode time, so it keeps its own share
+        let k = if own > dens { k.max((ideal.round() as usize).clamp(lo, hi)) } else { k };
         g.2 += ideal;
         g.3 += k;
+        if crate::sys::dev_flag("NZ_WTRACE") {
+            eprintln!("  dens own {own:.1} global {dens:.1} ideal {ideal:.2} n/sub {:.2}", n as f64 / sub as f64);
+        }
         if crate::sys::dev_flag("NZ_KBYTES") { hi } else { k }
     };
     let mut cuts = vec![0];
@@ -474,31 +480,94 @@ struct Lit {
     t1: Vec<G>,
     tm: Vec<G>,
     tx: Vec<G>,
-    m: MixV<8>,
+    m: MixV<4>,
 }
 
 /// Counter rate (shift) of the literal counters.
 const LRATE: u32 = 4;
 const TX_BITS: u32 = 18;
 
+/// Bytes the model reads before `pos`: the input itself when encoding, the decoder's
+/// output (history before the sub-block read as zeros) when decoding.
+trait Hist {
+    fn at(&self, i: usize) -> u8;
+    /// The byte coded at `pos` when encoding (0 when decoding).
+    fn lit(&self, pos: usize) -> u32;
+    /// The 8 bytes before `pos`, byte pos-1 highest (bytes before 0 read as zeros).
+    fn tail(&self, pos: usize) -> u64;
+}
+
+#[inline(always)]
+fn tail_slow<H: Hist + ?Sized>(buf: &H, pos: usize) -> u64 {
+    let mut t = 0u64;
+    for k in 1..=8usize {
+        t = (t << 8) | if pos >= k { buf.at(pos - k) as u64 } else { 0 };
+    }
+    t
+}
+
+impl Hist for [u8] {
+    #[inline(always)]
+    fn at(&self, i: usize) -> u8 {
+        self[i]
+    }
+    #[inline(always)]
+    fn lit(&self, pos: usize) -> u32 {
+        self.get(pos).map_or(0, |&b| b as u32)
+    }
+    #[inline(always)]
+    fn tail(&self, pos: usize) -> u64 {
+        if pos >= 8 { u64::from_le_bytes(self[pos - 8..pos].try_into().unwrap()) } else { tail_slow(self, pos) }
+    }
+}
+
+/// A sub-block being decoded in place: logical byte i >= d0 lives at p[i - d0]; the d0
+/// history bytes before it read as zeros (the first pass does not have them yet).
+struct DecBuf {
+    p: *mut u8,
+    d0: usize,
+}
+
+impl Hist for DecBuf {
+    #[inline(always)]
+    fn at(&self, i: usize) -> u8 {
+        if i >= self.d0 { unsafe { *self.p.add(i - self.d0) } } else { 0 }
+    }
+    #[inline(always)]
+    fn lit(&self, _pos: usize) -> u32 {
+        0
+    }
+    #[inline(always)]
+    fn tail(&self, pos: usize) -> u64 {
+        if pos >= self.d0 + 8 { unsafe { (self.p.add(pos - self.d0 - 8) as *const u64).read_unaligned() }.to_le() } else { tail_slow(self, pos) }
+    }
+}
+
 /// If `pos` is inside the rel32 operand of an x86 CALL/JMP/Jcc, returns (operand byte
 /// index 1..=4, context): the filtered operand is a big-endian absolute target, so its
 /// high byte tracks the position and each later byte the ones before it.
 #[inline(always)]
-fn op_ctx(buf: &[u8], pos: usize, base: usize) -> (usize, u32) {
+fn op_ctx<H: Hist + ?Sized>(buf: &H, pos: usize, base: usize) -> (usize, u32) {
+    op_ctx_t(buf.tail(pos), pos, base)
+}
+
+/// `op_ctx` from the 8 bytes before `pos` (`tail`).
+#[inline(always)]
+fn op_ctx_t(t: u64, pos: usize, base: usize) -> (usize, u32) {
+    let at = |k: usize| ((t >> (64 - 8 * k)) & 0xff) as u8; // byte pos-k
     for k in 1..=4usize {
         if pos < k {
             break;
         }
-        let i = pos - k;
-        let op = (buf[i] & 0xFE) == 0xE8 || (i >= 1 && buf[i - 1] == 0x0F && (buf[i] & 0xF0) == 0x80);
+        let bi = at(k);
+        let op = (bi & 0xFE) == 0xE8 || (pos > k && at(k + 1) == 0x0F && (bi & 0xF0) == 0x80);
         if op {
             let abs = base + pos;
             let ctx = match k {
                 1 => ((abs >> 16) & 0xff) as u32,
-                2 => ((buf[pos - 1] as u32) << 8) | ((abs >> 8) & 0xff) as u32,
-                3 => ((buf[pos - 2] as u32) << 8) | buf[pos - 1] as u32,
-                _ => buf[pos - 3] as u32,
+                2 => ((at(1) as u32) << 8) | ((abs >> 8) & 0xff) as u32,
+                3 => ((at(2) as u32) << 8) | at(1) as u32,
+                _ => at(3) as u32,
             };
             return (k, ctx);
         }
@@ -512,7 +581,8 @@ impl Lit {
             t1: vec![G::INIT; 256 * NG],
             tm: vec![G::INIT; 256 * NG],
             tx: vec![G::INIT; if x86ctx { 1 << TX_BITS } else { NG }],
-            m: MixV::new(256 * 2 * 5, 4, 6),
+            // inputs: the three counters and a bias (its weight starts at 0)
+            m: MixV::with_init(256 * 2 * 5, 4, [5460, 5460, 5460, 0]),
         }
     }
 
@@ -526,25 +596,34 @@ impl Lit {
     /// Codes (or decodes, per `io`) one literal; `mb` = match byte, `op` = op_ctx.
     #[inline(always)]
     fn code<IO: BitIo>(&mut self, io: &mut IO, byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32)) -> u32 {
+        // one loop per case, so the bit loop has no x86-context test
+        match Self::xc(op) {
+            Some(x) => self.code_x::<IO, true>(io, byte, prev, mb, matched, op, x),
+            None => self.code_x::<IO, false>(io, byte, prev, mb, matched, op, 0),
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn code_x<IO: BitIo, const X: bool>(&mut self, io: &mut IO, byte: u32, prev: u32, mb: u32, matched: bool, op: (usize, u32), xc: u32) -> u32 {
         let Lit { t1, tm, tx, m } = self;
-        let xc = Self::xc(op);
         let row = ((matched as usize) << 8) | (op.0 << 9);
         let mut c0 = 1usize;
         for half in 0..2 {
             let sel = if half == 0 { 0 } else { 1 + (c0 & 15) };
             let g1 = &mut t1[prev as usize * NG + sel].0;
             let gm = &mut tm[mb as usize * NG + sel].0;
-            let mut gx = xc.map(|x| &mut tx[hg(x + sel as u32, TX_BITS)].0);
+            let gx = &mut tx[if X { hg(xc + sel as u32, TX_BITS) } else { 0 }].0;
             let mut j = 1usize;
             for q in 0..4 {
-                let x = [g1[j].st(), 0, gm[j].st(), 0, gx.as_ref().map_or(0, |g| g[j].st()), 0, 256, 0];
+                let x = [g1[j].st(), gm[j].st(), if X { gx[j].st() } else { 0 }, 256];
                 let p = ((m.predict12(x, c0 | row) << 4) as u32).clamp(48, 65535 - 48);
                 let b = io.code((byte >> (7 - (half * 4 + q))) & 1, p);
                 m.update(b);
                 g1[j].update(b, LRATE);
                 gm[j].update(b, LRATE);
-                if let Some(g) = gx.as_mut() {
-                    g[j].update(b, LRATE);
+                if X {
+                    gx[j].update(b, LRATE);
                 }
                 j = (j << 1) | b as usize;
                 c0 = (c0 << 1) | b as usize;
@@ -597,7 +676,7 @@ impl Lit {
             let mut j = 1usize;
             for q in 0..4 {
                 let b = (byte >> (7 - (half * 4 + q))) & 1;
-                let x = [g1[j].st(), 0, gm[j].st(), 0, gx.map_or(0, |g| g[j].st()), 0, 256, 0];
+                let x = [g1[j].st(), gm[j].st(), gx.map_or(0, |g| g[j].st()), 256];
                 let p1 = self.m.peek12(&x, c0 | row).clamp(1, 4095) as u32;
                 s += t[(if b == 1 { p1 } else { 4096 - p1 }) as usize];
                 j = (j << 1) | b as usize;
@@ -763,10 +842,10 @@ impl Model {
     /// Codes one token at `pos`. `buf` holds every byte before `pos` (and, when encoding,
     /// the bytes after it). Returns the token and, for a literal, its byte.
     #[inline(always)]
-    fn code<IO: BitIo>(&mut self, io: &mut IO, buf: &[u8], pos: usize, t: Tok) -> (Tok, u8) {
+    fn code<IO: BitIo, H: Hist + ?Sized>(&mut self, io: &mut IO, buf: &H, pos: usize, t: Tok) -> (Tok, u8) {
         let s = self.state;
         let ps = pos & 3;
-        let lit_byte = if matches!(t, Tok::Lit) && pos < buf.len() { buf[pos] as u32 } else { 0 };
+        let lit_byte = if matches!(t, Tok::Lit) { buf.lit(pos) } else { 0 };
         if pos >= self.seg_end {
             let seg = pos >> SEG_BITS;
             self.seg_end = (seg + 1) << SEG_BITS;
@@ -776,10 +855,11 @@ impl Model {
         let out;
         let mut byte = 0u8;
         if self.dense || bit(io, &mut self.is_match[s][ps], (t != Tok::Lit) as u32) == 0 {
-            let prev = if pos > 0 { buf[pos - 1] as u32 } else { 0 };
+            let tail = buf.tail(pos);
+            let prev = (tail >> 56) as u32;
             let r0 = self.reps[0] as usize + 1;
-            let mb = if pos >= r0 { buf[pos - r0] as u32 } else { 0 };
-            let op = if self.x86ctx { op_ctx(buf, pos, self.base) } else { (0, 0) };
+            let mb = if pos >= r0 { buf.at(pos - r0) as u32 } else { 0 };
+            let op = if self.x86ctx { op_ctx_t(tail, pos, self.base) } else { (0, 0) };
             byte = self.lit.code(io, lit_byte, prev, mb, s >= 7, op) as u8;
             out = Tok::Lit;
         } else if bit(io, &mut self.is_rep[s], matches!(t, Tok::Rep(..) | Tok::Short) as u32) == 0 {
@@ -879,6 +959,7 @@ impl Mf {
         }
         let real = (n - p).min(MAX_LEN);
         let lim = self.nice;
+        self.prefetch_ahead(buf, n, p);
         let (h4, h3) = Self::hashes(buf, p);
         let c3 = self.head3[h3] as usize;
         let mut cur = self.head4[h4] as usize;
@@ -943,6 +1024,29 @@ impl Mf {
                 let l = match_len_from(buf, best_q, p, best, real);
                 if let Some(last) = o.last_mut() {
                     last.0 = l as u32;
+                }
+            }
+        }
+    }
+
+    /// The tree walk is a chain of dependent loads; warm the start of later walks (callers
+    /// go forward through the buffer): the hash bucket 16 positions ahead, and 8 ahead the
+    /// bucket's first candidate bytes and tree node. Only a hint: the walk is unchanged.
+    #[inline(always)]
+    fn prefetch_ahead(&self, buf: &[u8], n: usize, p: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            if p + 20 <= n {
+                let (h, _) = Self::hashes(buf, p + 16);
+                _mm_prefetch::<_MM_HINT_T0>(self.head4.as_ptr().add(h) as *const i8);
+            }
+            if p + 12 <= n {
+                let (h, _) = Self::hashes(buf, p + 8);
+                let c = *self.head4.get_unchecked(h) as usize;
+                if c > 0 {
+                    _mm_prefetch::<_MM_HINT_T0>(buf.as_ptr().add(c - 1) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(self.son.as_ptr().add(2 * (c - 1)) as *const i8);
                 }
             }
         }
@@ -1707,25 +1811,27 @@ fn encode_sub_a<const A: usize>(buf: &[u8], n: usize, d0: usize, base: usize, x8
 /// the sub-block): (offset in the sub-block, distance, length).
 type Fixup = (u32, u32, u32);
 
-/// First pass for one sub-block of `n` bytes with `d0` bytes of history before it (read as
-/// zeros): returns its bytes and the copies the second pass must redo, in order.
-fn decode_sub(src: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool) -> Result<(Vec<u8>, Vec<Fixup>), String> {
+/// First pass for one sub-block of `n` bytes, decoded in place into `out[..n]`, with `d0`
+/// bytes of history before it (read as zeros): returns the copies the second pass must
+/// redo, in order. A copy is redone when its source may hold a byte the first pass did not
+/// know (history, or the target of an earlier redone copy); redoing a correct copy is
+/// harmless, so whole copies are tracked, not single bytes.
+///
+/// Safety: `out` must be valid for writes of `n` bytes that nothing else touches.
+unsafe fn decode_sub(src: &[u8], out: *mut u8, n: usize, d0: usize, base: usize, x86ctx: bool) -> Result<Vec<Fixup>, String> {
     let mut m = Model::new(base, x86ctx);
     let mut dec = Decoder::new(src);
     let total = d0 + n;
-    let mut out: Vec<u8> = Vec::with_capacity(total);
-    out.resize(d0, 0);
-    // which bytes hold their real value (only tracked when there is history)
-    let mut known: Vec<u8> = if d0 > 0 { vec![0u8; d0] } else { Vec::new() };
+    let buf = DecBuf { p: out, d0 };
     let mut fix: Vec<Fixup> = Vec::new();
-    while out.len() < total {
-        let pos = out.len();
-        let (t, b) = m.code(&mut dec, &out, pos, Tok::Lit);
+    // bit i set: byte d0 + i may be unknown (the target of a redone copy)
+    let mut unk: Vec<u64> = if d0 > 0 { vec![0; n.div_ceil(64)] } else { Vec::new() };
+    let mut pos = d0;
+    while pos < total {
+        let (t, b) = m.code(&mut dec, &buf, pos, Tok::Lit);
         if let Tok::Lit = t {
-            out.push(b);
-            if d0 > 0 {
-                known.push(1);
-            }
+            unsafe { *out.add(pos - d0) = b };
+            pos += 1;
         } else {
             let d = match t {
                 Tok::Match(_, d) => d as usize,
@@ -1736,35 +1842,121 @@ fn decode_sub(src: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool) -> Res
                 return Err("corrupt LZ stream".into());
             }
             let start = pos - d;
-            if d >= len {
-                out.extend_from_within(start..start + len);
-            } else {
-                // overlapping copy: repeat the d-byte period
-                out.resize(pos + len, 0);
-                for k in pos..pos + len {
-                    out[k] = out[k - d];
-                }
-            }
+            unsafe { copy_match(out, d0, n, pos, d, len) };
             if d0 > 0 {
-                if d >= len {
-                    known.extend_from_within(start..start + len);
-                } else {
-                    known.resize(pos + len, 0);
-                    for k in pos..pos + len {
-                        known[k] = known[k - d];
-                    }
-                }
-                if known[pos..pos + len].contains(&0) {
+                if start < d0 {
+                    // the history part is unknown; the rest repeats bits from 0 on
                     fix.push(((pos - d0) as u32, d as u32, len as u32));
+                    let h = (d0 - start).min(len);
+                    bits_set(&mut unk, pos - d0, h);
+                    if h < len {
+                        bits_copy(&mut unk, 0, pos - d0 + h, len - h, d);
+                    }
+                } else if bits_any(&unk, start - d0, len) {
+                    fix.push(((pos - d0) as u32, d as u32, len as u32));
+                    bits_copy(&mut unk, start - d0, pos - d0, len, d);
                 }
             }
+            pos += len;
         }
         if dec.overrun() {
             return Err("LZ stream truncated".into());
         }
     }
-    out.drain(..d0);
-    Ok((out, fix))
+    Ok(fix)
+}
+
+/// Whether any of bits a..a+len (len >= 1) is set.
+#[inline(always)]
+fn bits_any(b: &[u64], a: usize, len: usize) -> bool {
+    let (w0, w1) = (a >> 6, (a + len - 1) >> 6);
+    let lo = !0u64 << (a & 63);
+    let hi = !0u64 >> (63 - ((a + len - 1) & 63));
+    if w0 == w1 {
+        return b[w0] & lo & hi != 0;
+    }
+    b[w0] & lo != 0 || b[w0 + 1..w1].iter().any(|&w| w != 0) || b[w1] & hi != 0
+}
+
+/// Sets bits a..a+len (len >= 1).
+#[inline(always)]
+fn bits_set(b: &mut [u64], a: usize, len: usize) {
+    let (w0, w1) = (a >> 6, (a + len - 1) >> 6);
+    let lo = !0u64 << (a & 63);
+    let hi = !0u64 >> (63 - ((a + len - 1) & 63));
+    if w0 == w1 {
+        b[w0] |= lo & hi;
+        return;
+    }
+    b[w0] |= lo;
+    b[w0 + 1..w1].iter_mut().for_each(|w| *w = !0);
+    b[w1] |= hi;
+}
+
+/// Copies bits src..src+len to dst..dst+len (src < dst), in steps of at most `d` =
+/// dst - src bits so an overlapping copy repeats its own output, like the byte copy.
+#[inline(always)]
+fn bits_copy(b: &mut [u64], src: usize, dst: usize, len: usize, d: usize) {
+    let get = |b: &[u64], a: usize, m: usize| -> u64 {
+        let (w, o) = (a >> 6, a & 63);
+        let mut v = b[w] >> o;
+        if o + m > 64 {
+            v |= b[w + 1] << (64 - o);
+        }
+        if m < 64 { v & ((1u64 << m) - 1) } else { v }
+    };
+    let step = d.min(64);
+    let mut k = 0;
+    while k < len {
+        let m = step.min(len - k);
+        let v = get(b, src + k, m);
+        let a = dst + k;
+        let (w, o) = (a >> 6, a & 63);
+        let mask = if m < 64 { (1u64 << m) - 1 } else { !0 };
+        b[w] = (b[w] & !(mask << o)) | (v << o);
+        if o + m > 64 {
+            let r = 64 - o;
+            b[w + 1] = (b[w + 1] & !(mask >> r)) | (v >> r);
+        }
+        k += m;
+    }
+}
+
+/// Copies `len` bytes from logical `pos - d` to `pos` in a sub-block decoded in place
+/// (`out` holds its `n` bytes from logical `d0`; history bytes read as zeros). Writes
+/// whole 16-byte chunks when the slack stays inside the sub-block: the extra bytes are
+/// overwritten later and never read before that.
+#[inline(always)]
+unsafe fn copy_match(out: *mut u8, d0: usize, n: usize, pos: usize, d: usize, len: usize) {
+    unsafe {
+        let at = pos - d0;
+        let dst = out.add(at);
+        if pos - d >= d0 {
+            let src = dst.sub(d);
+            if d >= 16 && at + len + 16 <= n {
+                let mut k = 0;
+                while k < len {
+                    (dst.add(k) as *mut u128).write_unaligned((src.add(k) as *const u128).read_unaligned());
+                    k += 16;
+                }
+            } else if d >= len {
+                std::ptr::copy_nonoverlapping(src, dst, len);
+            } else if d == 1 {
+                std::ptr::write_bytes(dst, *src, len);
+            } else {
+                for k in 0..len {
+                    *dst.add(k) = *src.add(k);
+                }
+            }
+        } else {
+            // the source starts in the history: those bytes read as zeros
+            let h = (d0 - (pos - d)).min(len);
+            std::ptr::write_bytes(dst, 0, h);
+            for k in h..len {
+                *dst.add(k) = *dst.add(k).sub(d);
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1775,8 +1967,8 @@ unsafe fn encode_avx2(buf: &[u8], n: usize, d0: usize, base: usize, x: bool, arr
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn decode_avx2(src: &[u8], n: usize, d0: usize, base: usize, x: bool) -> Result<(Vec<u8>, Vec<Fixup>), String> {
-    decode_sub(src, n, d0, base, x)
+unsafe fn decode_avx2(src: &[u8], out: *mut u8, n: usize, d0: usize, base: usize, x: bool) -> Result<Vec<Fixup>, String> {
+    unsafe { decode_sub(src, out, n, d0, base, x) }
 }
 
 fn encode_one(buf: &[u8], n: usize, d0: usize, base: usize, x: bool, arr: usize) -> Vec<u8> {
@@ -1787,12 +1979,13 @@ fn encode_one(buf: &[u8], n: usize, d0: usize, base: usize, x: bool, arr: usize)
     encode_sub(buf, n, d0, base, x, arr)
 }
 
-fn decode_one(src: &[u8], n: usize, d0: usize, base: usize, x: bool) -> Result<(Vec<u8>, Vec<Fixup>), String> {
+/// Safety: as `decode_sub`.
+unsafe fn decode_one(src: &[u8], out: *mut u8, n: usize, d0: usize, base: usize, x: bool) -> Result<Vec<Fixup>, String> {
     #[cfg(target_arch = "x86_64")]
     if crate::codec::has_avx2() {
-        return unsafe { decode_avx2(src, n, d0, base, x) };
+        return unsafe { decode_avx2(src, out, n, d0, base, x) };
     }
-    decode_sub(src, n, d0, base, x)
+    unsafe { decode_sub(src, out, n, d0, base, x) }
 }
 
 /// `sub_size:varint subs:varint {comp_len:varint}* streams...`
@@ -1921,15 +2114,25 @@ pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<
         jobs.push((s, raw, base));
         base += raw;
     }
-    // pass 1: every sub-block at once (history read as zeros)
-    let parts = crate::par::map_ranked(&jobs, threads, |j| j.0.len() as u64 + (j.1 >> 4) as u64, |&(s, len, base)| {
+    // pass 1: every sub-block at once, each into its place in `out` (history read as zeros)
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    struct Out(*mut u8);
+    unsafe impl Sync for Out {}
+    impl Out {
+        fn at(&self, i: usize) -> *mut u8 {
+            unsafe { self.0.add(i) }
+        }
+    }
+    let dst = Out(out.as_mut_ptr());
+    let fixes = crate::par::map_ranked(&jobs, threads, |j| j.0.len() as u64 + (j.1 >> 4) as u64, |&(s, len, base)| {
         let d0 = dict_len(base);
-        crate::par::with_memory(2 * (d0 + len) as u64 + (24 << 20), || {
+        crate::par::with_memory((len as u64 >> 2) + (24 << 20), || {
             let tr = crate::sys::dev_flag("NZ_DTRACE");
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             let t0 = T0.get_or_init(std::time::Instant::now);
             let a = t0.elapsed().as_secs_f64();
-            let d = decode_one(s, len, d0, base - d0, x86ctx);
+            // jobs cover disjoint ranges of `out`'s capacity
+            let d = unsafe { decode_one(s, dst.at(base), len, d0, base - d0, x86ctx) };
             if tr {
                 eprintln!("  piece {:>4} MB @{:>4} MB of {:>4}: comp {:>6} KB {a:.2}-{:.2}s {:.3}", len >> 20, base >> 20, n >> 20, s.len() >> 10, t0.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64() - a);
             }
@@ -1937,18 +2140,17 @@ pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<
             d
         })
     });
+    let fixes = fixes.into_iter().collect::<Result<Vec<_>, _>>()?;
+    // every byte was written: each piece fills exactly its range
+    unsafe { out.set_len(n) };
     // pass 2, in order: the copies that reached into earlier sub-blocks
     let tp = std::time::Instant::now();
     let mut nfix = 0usize;
-    let mut out = Vec::with_capacity(n);
-    for p in parts {
-        let (bytes, fix) = p?;
-        let at = out.len();
-        out.extend_from_slice(&bytes);
-        for &(pos, d, len) in &fix {
+    for (fix, &(_, _, at)) in fixes.iter().zip(&jobs) {
+        for &(pos, d, len) in fix {
             let dst = at + pos as usize;
             let d = d as usize;
-            if d == 0 || d > dst || dst + len as usize > out.len() {
+            if d == 0 || d > dst || dst + len as usize > n {
                 return Err(e());
             }
             // in steps of at most `d` bytes: an overlapping copy repeats its own output
@@ -2009,7 +2211,7 @@ mod perf {
         let t = std::time::Instant::now();
         let mut pb = buf.to_vec();
         pb.resize(buf.len() + super::NICE + 8, 0);
-        let mut mf = super::Mf::new(buf.len(), DEPTH);
+        let mut mf = super::Mf::new(buf.len(), super::DEPTH);
         let mut out = Vec::new();
         let mut cnt = 0usize;
         for p in 0..buf.len() {
