@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 
 const AVG_BITS_DEFAULT: u32 = 8;
@@ -101,8 +101,11 @@ pub fn texty(b: &[u8]) -> bool {
     !b.is_empty() && printable * 100 >= b.len() * 95
 }
 
-/// The chunks of a file in order: (key, length), and whether the file starts like text.
+/// The chunks of a file in order: (key, length), and whether the file starts like text
+/// (the plain reference for `chunk_round`).
+#[cfg(test)]
 fn chunk_file(p: &Path, size: u64) -> io::Result<(Vec<(u64, u32)>, bool)> {
+    use std::io::Read;
     let mut f = File::open(p)?.take(size);
     let mut out = Vec::with_capacity((size >> avg_bits()) as usize + 1);
     let mut buf = vec![0u8; 4 << 20];
@@ -137,107 +140,125 @@ fn chunk_file(p: &Path, size: u64) -> io::Result<(Vec<(u64, u32)>, bool)> {
     }
 }
 
-/// Files at least this big are chunked one at a time, each cut into slices hashed on
-/// every thread (a few big files would otherwise leave most threads idle).
-const BIG_FILE: u64 = 16 << 20;
-/// Bytes of a big file in memory at once.
-const WINDOW: u64 = 64 << 20;
+/// Bytes per chunking job: small enough that a slice stays in cache from reading to
+/// hashing to keying.
+const SLICE: u64 = 4 << 20;
 
-/// `chunk_file` for big files, with the same chunks: a boundary depends only on the 64
-/// bytes before it (the gear hash forgets older bytes) and on the minimum / maximum chunk
-/// length since the previous boundary, so slices find candidate positions in parallel and
-/// one cheap pass picks the boundaries in order.
-fn chunk_big(p: &Path, size: u64, threads: usize, window: u64) -> io::Result<(Vec<(u64, u32)>, bool)> {
-    let f = File::open(p)?;
+/// One slice's chunks, found as if a chunk began at the slice start: (start, key, len),
+/// and the candidate positions (see `chunk_round`).
+struct SliceChunks {
+    starts: Vec<u64>,
+    keys: Vec<(u64, u32)>,
+    cands: Vec<u64>,
+    text: bool,
+}
+
+/// `chunk_file` for every file of a round at once, with the same chunks. A boundary
+/// depends only on the 64 bytes before it (the gear hash forgets older bytes) and on the
+/// minimum / maximum chunk length since the previous boundary. So every slice of every
+/// file is read, hashed and keyed in one pass on its own thread, as if a chunk started
+/// at the slice start; joining the slices in order, the real chain soon lands on one of
+/// the slice's boundaries, and from there on the slice's chunks are the real ones (the
+/// few before are keyed again).
+fn chunk_round(round: &[(usize, &Path, u64)], threads: usize) -> Vec<io::Result<(Vec<(u64, u32)>, bool)>> {
     let bits = avg_bits();
     let (min_chunk, max_chunk) = (1u64 << (bits - 2), 1u64 << (bits + 3));
-    let mut out = Vec::with_capacity((size >> bits) as usize + 1);
-    let mut text = None;
-    let mut start = 0u64; // the last boundary: the window starts there
-    let mut buf = Vec::new();
-    while start < size {
-        let we = (start + window).min(size);
-        let last = we == size;
-        let b0 = start.saturating_sub(64); // 64 bytes before the window warm the hash up
-        buf.resize((we - b0) as usize, 0);
-        // filled by every thread (one sequential read would be the slow part)
-        let parts: Vec<&mut [u8]> = buf.chunks_mut(4 << 20).collect();
-        let errs = std::sync::Mutex::new(None);
-        crate::par::for_chunks(parts, threads, |i, part| {
-            if let Err(e) = read_at(&f, part, b0 + (i as u64) * (4 << 20)) {
-                *errs.lock().unwrap() = Some(e);
-            }
-        });
-        if let Some(e) = errs.into_inner().unwrap() {
-            return Err(e);
-        }
-        text.get_or_insert_with(|| texty(&buf[..buf.len().min(64 << 10)]));
-        // candidates: positions i in (start, we] where the hash of the bytes before i fits
-        let n = (we - start) as usize;
-        let k = threads.clamp(1, 64).min(n.div_ceil(1 << 20));
-        let ranges: Vec<(usize, usize)> = (0..k).map(|j| (start as usize - b0 as usize + n * j / k, start as usize - b0 as usize + n * (j + 1) / k)).collect();
-        let b = &buf;
-        let cands: Vec<Vec<u64>> = crate::par::map(&ranges, threads, |&(r0, r1)| {
-            // four quarters side by side: four independent hash chains keep the core busy
-            let q = (r1 - r0) / 4;
-            let st = [r0, r0 + q, r0 + 2 * q, r0 + 3 * q];
-            let mut h = [0u64; 4];
-            for k in 0..4 {
-                for &c in &b[st[k].saturating_sub(64)..st[k]] {
-                    h[k] = (h[k] << 1).wrapping_add(GEAR[c as usize]);
-                }
-            }
-            let mut v: [Vec<u64>; 4] = std::array::from_fn(|_| Vec::with_capacity((q >> bits) * 2 + 8));
-            for j in 0..q {
-                for k in 0..4 {
-                    let at = st[k] + j;
-                    h[k] = (h[k] << 1).wrapping_add(GEAR[b[at] as usize]);
-                    if h[k] >> (64 - bits) == 0 {
-                        v[k].push(b0 + (at + 1) as u64);
-                    }
-                }
-            }
-            for at in r0 + 4 * q..r1 {
-                h[3] = (h[3] << 1).wrapping_add(GEAR[b[at] as usize]);
-                if h[3] >> (64 - bits) == 0 {
-                    v[3].push(b0 + (at + 1) as u64);
-                }
-            }
-            v.concat()
-        });
-        // boundaries, as `chunk_end` picks them
-        let mut bounds = vec![start];
-        let mut p0 = start;
-        let mut it = cands.iter().flatten().copied().peekable();
+    let mut jobs: Vec<(usize, u64, u64)> = Vec::new(); // (file in round, start, end)
+    for (k, &(_, _, size)) in round.iter().enumerate() {
+        let mut s = 0;
         loop {
-            while it.peek().is_some_and(|&c| c < p0 + min_chunk) {
-                it.next();
+            let e = (s + SLICE).min(size);
+            jobs.push((k, s, e));
+            if e >= size {
+                break;
             }
-            let lim = (p0 + max_chunk).min(we);
-            match it.peek() {
-                Some(&c) if c <= lim => {
-                    bounds.push(c);
-                    p0 = c;
-                    it.next();
-                }
-                _ if lim - p0 == max_chunk || (last && lim > p0) => {
-                    bounds.push(lim);
-                    p0 = lim;
-                }
-                _ => break,
-            }
+            s = e;
         }
-        // keys of the chunks, in parallel
-        let pairs: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
-        let groups: Vec<&[(u64, u64)]> = pairs.chunks(4096).collect();
-        let keys: Vec<Vec<(u64, u32)>> = crate::par::map(&groups, threads, |g| g.iter().map(|&(a, z)| (chunk_key(&b[(a - b0) as usize..(z - b0) as usize]), (z - a) as u32)).collect());
-        out.extend(keys.into_iter().flatten());
-        if p0 == start {
-            break; // nothing more (only happens at the end)
-        }
-        start = p0;
     }
-    Ok((out, text.unwrap_or(false)))
+    let slices: Vec<io::Result<SliceChunks>> = crate::par::map(&jobs, threads, |&(k, s, e)| {
+        let (_, p, size) = round[k];
+        let f = File::open(p)?;
+        let b0 = s.saturating_sub(64);
+        let b1 = (e + max_chunk).min(size);
+        let mut b = vec![0u8; (b1 - b0) as usize];
+        read_at(&f, &mut b, b0)?;
+        let text = s == 0 && texty(&b[..b.len().min(64 << 10)]);
+        // candidates in (s, b1]
+        let mut h = 0u64;
+        for &c in &b[..(s - b0) as usize] {
+            h = (h << 1).wrapping_add(GEAR[c as usize]);
+        }
+        let mut cands = Vec::with_capacity(((b1 - s) >> bits) as usize * 2 + 8);
+        for (j, &c) in b[(s - b0) as usize..].iter().enumerate() {
+            h = (h << 1).wrapping_add(GEAR[c as usize]);
+            if h >> (64 - bits) == 0 {
+                cands.push(s + j as u64 + 1);
+            }
+        }
+        // chunks from s, those that start before e
+        let (mut starts, mut keys) = (Vec::new(), Vec::new());
+        let mut p0 = s;
+        let mut ci = 0;
+        while p0 < e {
+            while ci < cands.len() && cands[ci] < p0 + min_chunk {
+                ci += 1;
+            }
+            let lim = (p0 + max_chunk).min(size);
+            let end = if ci < cands.len() && cands[ci] <= lim { cands[ci] } else { lim };
+            starts.push(p0);
+            keys.push((chunk_key(&b[(p0 - b0) as usize..(end - b0) as usize]), (end - p0) as u32));
+            p0 = end;
+        }
+        Ok(SliceChunks { starts, keys, cands, text })
+    });
+    // join each file's slices in order
+    let mut out: Vec<io::Result<(Vec<(u64, u32)>, bool)>> = Vec::with_capacity(round.len());
+    let mut si = slices.into_iter();
+    for (k, &(_, p, size)) in round.iter().enumerate() {
+        let n = jobs.iter().filter(|j| j.0 == k).count();
+        let mine: Vec<io::Result<SliceChunks>> = si.by_ref().take(n).collect();
+        out.push((|| {
+            let mut keys: Vec<(u64, u32)> = Vec::with_capacity((size >> bits) as usize + 1);
+            let mut text = false;
+            let mut at = 0u64; // the real chain: next chunk starts here
+            let mut f: Option<File> = None;
+            for (j, sl) in mine.into_iter().enumerate() {
+                let sl = sl?;
+                if j == 0 {
+                    text = sl.text;
+                }
+                // follow the real chain over the slice's candidates until it meets one of
+                // the slice's own chunk starts
+                let mut ci = 0;
+                loop {
+                    if let Ok(i) = sl.starts.binary_search(&at) {
+                        keys.extend_from_slice(&sl.keys[i..]);
+                        let (last_start, last) = (sl.starts[sl.starts.len() - 1], sl.keys[sl.keys.len() - 1]);
+                        at = last_start + last.1 as u64;
+                        break;
+                    }
+                    if sl.starts.last().is_none_or(|&l| at > l) {
+                        break; // the chain skipped past this slice's chunk starts
+                    }
+                    while ci < sl.cands.len() && sl.cands[ci] < at + min_chunk {
+                        ci += 1;
+                    }
+                    let lim = (at + max_chunk).min(size);
+                    let end = if ci < sl.cands.len() && sl.cands[ci] <= lim { sl.cands[ci] } else { lim };
+                    let fh = match &f {
+                        Some(x) => x,
+                        None => f.insert(File::open(p)?),
+                    };
+                    let mut buf = vec![0u8; (end - at) as usize];
+                    read_at(fh, &mut buf, at)?;
+                    keys.push((chunk_key(&buf), (end - at) as u32));
+                    at = end;
+                }
+            }
+            Ok((keys, text))
+        })());
+    }
+    out
 }
 
 /// Reads `buf.len()` bytes at `off` without moving a shared file position.
@@ -366,14 +387,7 @@ pub fn find(files: &[(usize, &Path, u64)], threads: usize) -> io::Result<Vec<Opt
     let mut tchunk = 0.0;
     for round in files.chunks(ROUND) {
         let tc = std::time::Instant::now();
-        // small files side by side, big ones one at a time on every thread
-        let mut chunks = crate::par::map(round, threads, |&(_, p, size)| if size < BIG_FILE { Some(chunk_file(p, size)) } else { None });
-        for (c, &(_, p, size)) in chunks.iter_mut().zip(round) {
-            if c.is_none() {
-                *c = Some(chunk_big(p, size, threads, WINDOW));
-            }
-        }
-        let chunks = chunks.into_iter().map(|c| c.unwrap()).collect::<io::Result<Vec<_>>>()?;
+        let chunks = chunk_round(round, threads).into_iter().collect::<io::Result<Vec<_>>>()?;
         tchunk += tc.elapsed().as_secs_f64();
         // every chunk of the round: (key, stream offset)
         let mut keys: Vec<(u64, u64)> = Vec::with_capacity(chunks.iter().map(|c| c.0.len()).sum());
@@ -529,7 +543,7 @@ mod tests {
     #[test]
     fn big_file_chunks_match() {
         let mut x = 5u64;
-        let mut v: Vec<u8> = (0..3_000_000)
+        let mut v: Vec<u8> = (0..11_000_000)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -543,9 +557,14 @@ mod tests {
         let p = std::env::temp_dir().join(format!("nzip-dedup-test-{}", std::process::id()));
         std::fs::write(&p, &v).unwrap();
         let a = super::chunk_file(&p, v.len() as u64).unwrap();
-        for w in [1 << 20, 3 << 20, 64 << 20] {
-            assert!(super::chunk_big(&p, v.len() as u64, 4, w).unwrap() == a, "window {w}");
-        }
+        // a file cut in several slices, and small files next to it
+        let q = p.with_extension("small");
+        std::fs::write(&q, &v[..300_000]).unwrap();
+        let b = super::chunk_file(&q, 300_000).unwrap();
+        let round = [(0, p.as_path(), v.len() as u64), (1, q.as_path(), 300_000), (2, p.as_path(), v.len() as u64)];
+        let r = super::chunk_round(&round, 4);
+        assert!(r[0].as_ref().unwrap() == &a && r[1].as_ref().unwrap() == &b && r[2].as_ref().unwrap() == &a);
+        let _ = std::fs::remove_file(&q);
         let _ = std::fs::remove_file(&p);
     }
 }

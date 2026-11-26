@@ -17,12 +17,16 @@ use crate::container::{read_varint, write_varint};
 
 const MIN_MATCH: usize = 4;
 const HASH_BITS: u32 = 17;
+/// Bits of the 8-byte (long match) hash table.
+const LONG_BITS: u32 = 16;
 /// Longest Huffman code (decode tables have 2^MAX_BITS entries).
-const MAX_BITS: u32 = 11;
+const MAX_BITS: u32 = 12;
 /// Alphabets: bytes; run / length buckets (see `bucket`); distance buckets (0 = repeat).
 const LIT_SYMS: usize = 256;
 const LEN_SYMS: usize = 16 + 2 * 28;
-const DIST_SYMS: usize = 1 + 32;
+/// Recent distances a match can repeat for free.
+const REPS: usize = 3;
+const DIST_SYMS: usize = REPS + 32;
 
 // ---------------------------------------------------------------- buckets
 
@@ -49,12 +53,29 @@ fn unbucket(c: usize) -> (usize, u32) {
     ((2 | m) << (b - 1), b as u32 - 1)
 }
 
-/// Distance bucket: 0 repeats the last distance; else 1 + floor(log2(d)), the bits below
-/// the top one following as extra bits.
+/// Distance bucket: below REPS, repeats of the recent distances (0 = the last); else
+/// REPS + floor(log2(d)), the bits below the top one following as extra bits.
 #[inline(always)]
 fn dist_bucket(d: usize) -> (usize, u32, u64) {
     let b = usize::BITS - 1 - d.leading_zeros();
-    (1 + b as usize, b, (d & ((1 << b) - 1)) as u64)
+    (REPS + b as usize, b, (d & ((1 << b) - 1)) as u64)
+}
+
+/// Recent distances after a match at `d`: a repeat moves to the front, a new one pushes
+/// the oldest out. Returns the distance's code (repeat index, or REPS for a new one).
+#[inline(always)]
+fn use_dist(reps: &mut [usize; REPS], d: usize) -> usize {
+    match reps.iter().position(|&r| r == d) {
+        Some(k) => {
+            reps[..=k].rotate_right(1);
+            k
+        }
+        None => {
+            reps.rotate_right(1);
+            reps[0] = d;
+            REPS
+        }
+    }
 }
 
 // ---------------------------------------------------------------- bits
@@ -264,7 +285,7 @@ fn get_lengths(src: &[u8], i: &mut usize, n: usize) -> Result<Vec<u8>, String> {
 struct Seq {
     lit: u32,
     len: u32,
-    /// 0 = repeat the last distance
+    /// below REPS: repeat of a recent distance (0 = the last), else REPS + the distance
     dist: u32,
 }
 
@@ -305,6 +326,10 @@ struct Finder {
     t: Vec<u32>,
     bits: u32,
     ways: usize,
+    /// most recent position per 8-byte hash (empty: off): finds long matches the 5-byte
+    /// table has lost to newer positions
+    tl: Vec<u32>,
+    lbits: u32,
 }
 
 impl Finder {
@@ -313,7 +338,15 @@ impl Finder {
         (((read64(s, i) << 24).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize) * self.ways
     }
     #[inline(always)]
+    fn lslot(&self, s: &[u8], i: usize) -> usize {
+        (read64(s, i).wrapping_mul(0x9FB2_1C65_1E98_DF25) >> (64 - self.lbits)) as usize
+    }
+    #[inline(always)]
     fn insert(&mut self, s: &[u8], i: usize) {
+        if !self.tl.is_empty() {
+            let hl = self.lslot(s, i);
+            self.tl[hl] = i as u32;
+        }
         let h = self.slot(s, i);
         if self.ways > 1 {
             self.t.copy_within(h..h + self.ways - 1, h + 1);
@@ -326,6 +359,14 @@ impl Finder {
         let h = self.slot(s, i);
         let v = read32(s, i);
         let mut best: Option<(usize, usize)> = None;
+        if !self.tl.is_empty() {
+            let hl = self.lslot(s, i);
+            let c = self.tl[hl] as usize;
+            self.tl[hl] = i as u32;
+            if c < i && read64(s, c) == read64(s, i) {
+                best = Some((c, extend(s, c, i, 8)));
+            }
+        }
         for w in 0..self.ways {
             let c = self.t[h + w] as usize;
             if c < i && read32(s, c) == v {
@@ -358,36 +399,47 @@ fn parse(s: &[u8]) -> (Vec<u8>, Vec<Seq>) {
     let mut lits = Vec::with_capacity(n / 2);
     let mut seqs = Vec::with_capacity(n / 16);
     let ways = knob("NZ_FWAYS", 1).clamp(1, 8);
-    let mut f = Finder { t: vec![0u32; (1 << knob("NZ_FHB", HASH_BITS as usize)) * ways], bits: knob("NZ_FHB", HASH_BITS as usize) as u32, ways };
+    let lbits = knob("NZ_FLONG", LONG_BITS as usize) as u32;
+    let mut f = Finder {
+        t: vec![0u32; (1 << knob("NZ_FHB", HASH_BITS as usize)) * ways],
+        bits: knob("NZ_FHB", HASH_BITS as usize) as u32,
+        ways,
+        tl: if lbits > 0 { vec![0u32; 1 << lbits] } else { Vec::new() },
+        lbits: lbits.max(1),
+    };
     let lazy = knob("NZ_FLAZY", 1) != 0;
+    let skip = knob("NZ_FSKIP", 7) as u32;
     let mut anchor = 0;
-    let mut rep = 1usize;
+    let mut reps = [1usize; REPS];
     let mut i = 1;
-    // a repeat of the last distance first (cheap, and its distance costs nothing), else the
-    // hash table: (start, source, length, is a repeat)
-    let probe = |f: &mut Finder, i: usize, rep: usize| -> Option<(usize, usize, usize, bool)> {
-        if i >= rep && read32(s, i) == read32(s, i - rep) {
-            f.insert(s, i);
-            return Some((i, i - rep, extend(s, i - rep, i, 4), true));
+    // a repeat of one of the last two distances first (cheap, and its distance costs
+    // nothing), else the hash tables: (start, source, length, is a repeat)
+    let probe = |f: &mut Finder, i: usize, reps: [usize; REPS]| -> Option<(usize, usize, usize, bool)> {
+        let v = read32(s, i);
+        for r in reps {
+            if i >= r && v == read32(s, i - r) {
+                f.insert(s, i);
+                return Some((i, i - r, extend(s, i - r, i, 4), true));
+            }
         }
         f.find(s, i).map(|(c, l)| (i, c, l, false))
     };
     if n >= 16 {
         let limit = n - 8;
         while i < limit {
-            let Some(mut m) = probe(&mut f, i, rep) else {
-                // skip faster through data without matches
-                i += 1 + ((i - anchor) >> 6);
+            let Some(mut m) = probe(&mut f, i, reps) else {
+                // skip faster through data without matches (one more per 2^skip misses)
+                i += 1 + ((i - anchor) >> skip);
                 continue;
             };
             // one step lazy: a better match at the next position wins over this one
             while lazy && m.2 < 64 && m.0 + 1 < limit {
-                match probe(&mut f, m.0 + 1, rep) {
+                match probe(&mut f, m.0 + 1, reps) {
                     Some(m2) if worth(m2.2, m2.0 - m2.1, m2.3) > worth(m.2, m.0 - m.1, m.3) + 4 => m = m2,
                     _ => break,
                 }
             }
-            let (mut st, mut cs, mut len, mut is_rep) = m;
+            let (mut st, mut cs, mut len, _) = m;
             // extend backward into pending literals
             while st > anchor && cs > 0 && s[st - 1] == s[cs - 1] {
                 st -= 1;
@@ -395,12 +447,10 @@ fn parse(s: &[u8]) -> (Vec<u8>, Vec<Seq>) {
                 len += 1;
             }
             let d = st - cs;
-            if d != rep {
-                is_rep = false;
-            }
+            let code = use_dist(&mut reps, d);
+            let dist = if code < REPS { code as u32 } else { (REPS + d) as u32 };
             lits.extend_from_slice(&s[anchor..st]);
-            seqs.push(Seq { lit: (st - anchor) as u32, len: (len - MIN_MATCH) as u32, dist: if is_rep { 0 } else { d as u32 } });
-            rep = d;
+            seqs.push(Seq { lit: (st - anchor) as u32, len: (len - MIN_MATCH) as u32, dist });
             i = st + len;
             anchor = i;
             // positions inside the match: a couple into the table
@@ -426,7 +476,7 @@ pub fn compress(s: &[u8]) -> Vec<u8> {
     for q in &seqs {
         fr[bucket(q.lit as usize).0] += 1;
         fm[bucket(q.len as usize).0] += 1;
-        fd[if q.dist == 0 { 0 } else { dist_bucket(q.dist as usize).0 }] += 1;
+        fd[if (q.dist as usize) < REPS { q.dist as usize } else { dist_bucket(q.dist as usize - REPS).0 }] += 1;
     }
     let (ll, lr, lm, ld) = (code_lengths(&fl), code_lengths(&fr), code_lengths(&fm), code_lengths(&fd));
     let (cl, cr, cm, cd) = (codes(&ll), codes(&lr), codes(&lm), codes(&ld));
@@ -453,10 +503,10 @@ pub fn compress(s: &[u8]) -> Vec<u8> {
         let (c, k, x) = bucket(q.len as usize);
         w.put(cm[c] as u64, lm[c] as u32);
         w.put(x, k);
-        if q.dist == 0 {
-            w.put(cd[0] as u64, ld[0] as u32);
+        if (q.dist as usize) < REPS {
+            w.put(cd[q.dist as usize] as u64, ld[q.dist as usize] as u32);
         } else {
-            let (c, k, x) = dist_bucket(q.dist as usize);
+            let (c, k, x) = dist_bucket(q.dist as usize - REPS);
             w.put(cd[c] as u64, ld[c] as u32);
             w.put(x, k);
         }
@@ -552,21 +602,25 @@ pub fn decompress(src: &[u8], n: usize) -> Result<Vec<u8>, String> {
     let mut ol = 0usize;
     let mut br = BitR { b: seq_src, pos: 0 };
     let mut lp = 0usize;
-    let mut rep = 1usize;
+    let mut reps = [1usize; REPS];
     for _ in 0..n_seq {
         let (base, k) = unbucket(sym(&mut br, &tr).map_err(|_| e())?);
         let lit = base + br.bits(k) as usize;
         let (base, k) = unbucket(sym(&mut br, &tm).map_err(|_| e())?);
         let len = base + br.bits(k) as usize + MIN_MATCH;
         let dc = sym(&mut br, &td).map_err(|_| e())?;
-        let d = if dc == 0 {
-            rep
+        let d = if dc < REPS {
+            reps[..=dc].rotate_right(1);
+            reps[0]
         } else {
-            let b = dc as u32 - 1;
+            let b = (dc - REPS) as u32;
             if b > 31 {
                 return Err(e());
             }
-            (1usize << b) | br.bits(b) as usize
+            let d = (1usize << b) | br.bits(b) as usize;
+            reps.rotate_right(1);
+            reps[0] = d;
+            d
         };
         if lit > n_lit - lp || lit + len > n - ol || d == 0 || d > ol + lit {
             return Err(e());
@@ -600,7 +654,6 @@ pub fn decompress(src: &[u8], n: usize) -> Result<Vec<u8>, String> {
             }
             ol += len;
         }
-        rep = d;
     }
     let rest = n_lit - lp;
     if br.overrun() || ol + rest != n {
