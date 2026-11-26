@@ -55,6 +55,137 @@ impl View {
     }
 }
 
+/// Greedy LZ pass that counts (literals, matches) per 64 KiB chunk of `data`: decode time
+/// is about a fixed cost per literal plus one per match, whatever the bytes, so this tells
+/// where sub-block cuts give every decoder thread the same work. Regions run in parallel,
+/// each with the DICT bytes before it sparsely in its table.
+fn work_map(data: &[u8], threads: usize) -> Vec<(u32, u32)> {
+    const TB: u32 = 20;
+    const MIN: usize = 6;
+    let n = data.len();
+    let chunks = n.div_ceil(1 << SEG_BITS);
+    let region = (n.div_ceil(threads.max(1))).next_multiple_of(1 << SEG_BITS).max(4 << 20);
+    let regions: Vec<usize> = (0..n.div_ceil(region)).collect();
+    #[inline(always)]
+    fn key(d: &[u8], p: usize) -> usize {
+        let v = u64::from_le_bytes(d[p..p + 8].try_into().unwrap()) << 16;
+        (v.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - TB)) as usize
+    }
+    let parts = crate::par::map(&regions, threads, |&r| {
+        let (r0, r1) = (r * region, ((r + 1) * region).min(n));
+        let mut out = vec![(0u32, 0u32); (r1 - r0).div_ceil(1 << SEG_BITS)];
+        let mut tab = vec![0u32; 1 << TB];
+        let end = n.saturating_sub(8);
+        for p in (r0.saturating_sub(DICT)..r0.min(end)).step_by(4) {
+            tab[key(data, p)] = p as u32 + 1;
+        }
+        let mut p = r0;
+        while p < r1 {
+            let c = (p - r0) >> SEG_BITS;
+            if p >= end {
+                out[c].0 += 1;
+                p += 1;
+                continue;
+            }
+            let h = key(data, p);
+            let cand = tab[h] as usize;
+            tab[h] = p as u32 + 1;
+            if cand != 0 && p + 1 - cand <= DICT && data[cand - 1..cand - 1 + MIN] == data[p..p + MIN] {
+                let src = cand - 1;
+                let mut l = MIN;
+                while p + l < n && l < 4096 && data[src + l] == data[p + l] {
+                    l += 1;
+                }
+                out[c].1 += 1;
+                if l > 16 && p + l / 2 < end {
+                    tab[key(data, p + l / 2)] = (p + l / 2) as u32 + 1;
+                }
+                p += l;
+            } else {
+                out[c].0 += 1;
+                p += 1;
+            }
+        }
+        out
+    });
+    let mut all: Vec<(u32, u32)> = parts.into_iter().flatten().collect();
+    all.truncate(chunks);
+    all
+}
+
+/// Decode work of one chunk in work_map units (calibrated on the decoder).
+#[inline]
+fn work_of(c: (u32, u32)) -> u64 {
+    LIT_WORK * c.0 as u64 + MATCH_WORK * c.1 as u64 + (1 << SEG_BITS) / 16
+}
+const LIT_WORK: u64 = 15;
+const MATCH_WORK: u64 = 0;
+
+/// Work density (units per byte) of the data coded so far, x1024: sub-blocks of a block
+/// denser than that are cut smaller, so pieces of every block take about the same time.
+static WORK: std::sync::Mutex<(u64, u64, f64, usize)> = std::sync::Mutex::new((0, 0, 0.0, 0));
+
+/// Sub-block starts (and `data.len()` last): `sub` bytes each on average, cut where every
+/// piece holds the same decode work.
+fn piece_cuts(data: &[u8], sub: usize, threads: usize) -> Vec<usize> {
+    let n = data.len();
+    if n <= sub.max(2 << SEG_BITS) || crate::sys::dev_flag("NZ_BYTECUTS") {
+        if n <= sub {
+            let mut g = WORK.lock().unwrap();
+            g.2 += n as f64 / sub as f64;
+            g.3 += 1;
+        }
+        let mut c: Vec<usize> = (0..n.div_ceil(sub.max(1)).max(1)).map(|i| i * sub).collect();
+        c.push(n);
+        return c;
+    }
+    let w: Vec<u64> = work_map(data, threads).into_iter().map(work_of).collect();
+    let total: u64 = w.iter().sum();
+    // cuts: a blend of equal work (decode balance) and equal bytes (every piece's model
+    // gets as much data to learn from)
+    let blend: u64 = crate::sys::dev_var("NZ_WBLEND").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let cw: Vec<u64> = w.iter().enumerate().map(|(i, &x)| {
+        let bytes = ((i + 1) << SEG_BITS).min(n) - (i << SEG_BITS);
+        (x * blend * n as u64 / total.max(1) + bytes as u64 * (100 - blend)) / 100
+    }).collect();
+    let ctotal: u64 = cw.iter().sum();
+    // pieces: this block's work over a share's worth at the density seen so far
+    // pieces: this block's work over a share's worth at the density seen so far; the
+    // blocks' fractions add up (rather than each rounding up), so a batch of blocks
+    // makes about one piece per thread
+    let k = {
+        let mut g = WORK.lock().unwrap();
+        g.0 += total;
+        g.1 += n as u64;
+        let dens = g.0 as f64 / g.1 as f64;
+        let own = total as f64 / n as f64;
+        let ideal = n as f64 / sub as f64 * own / dens;
+        let (lo, hi) = (n.div_ceil(SUB_BLOCK).max(1), n.div_ceil(sub).max(1));
+        let k = ((g.2 + ideal + 0.2).floor() as i64 - g.3 as i64).clamp(lo as i64, hi as i64) as usize;
+        g.2 += ideal;
+        g.3 += k;
+        if crate::sys::dev_flag("NZ_KBYTES") { hi } else { k }
+    };
+    let mut cuts = vec![0];
+    let mut acc = 0u64;
+    let mut next = 1;
+    for (i, &x) in cw.iter().enumerate() {
+        acc += x;
+        let at = (i + 1) << SEG_BITS;
+        if next < k && acc * k as u64 >= ctotal * next as u64 && at < n {
+            cuts.push(at);
+            next += 1;
+        } else if at - cuts[cuts.len() - 1] >= SUB_BLOCK && at < n {
+            cuts.push(at);
+        }
+    }
+    cuts.push(n);
+    if crate::sys::dev_flag("NZ_WTRACE") {
+        eprintln!("  cuts of {} MB: {} pieces (by bytes {}), MB {:?}", n >> 20, cuts.len() - 1, n.div_ceil(sub), cuts.windows(2).map(|c| (c[1] - c[0]) >> 20).collect::<Vec<_>>());
+    }
+    cuts
+}
+
 /// Largest sub-block for effort-capped streams (see `encode`).
 const FAST_SUB: usize = 16 << 20;
 
@@ -1449,7 +1580,7 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
             // lower effort also searches less: capped streams much less
             let t = std::time::Instant::now();
             let mut mf = Mf::new(n, if arr != 0 { DEPTH / 8 } else if effort(0) < 4 { DEPTH / 2 } else { DEPTH });
-            let step = if arr != 0 || effort(0) == 1 { 4 } else { 2 };
+            let step = crate::sys::dev_var("NZ_HSTEP").and_then(|v| v.parse().ok()).unwrap_or(if arr != 0 || effort(0) == 1 { 4 } else { 2 });
             mf.insert_history(buf, n, d0, fl, step);
             let mut busy = t.elapsed();
             let mut done = d0;
@@ -1678,9 +1809,12 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     // capped effort marks bulk data that must go fast: smaller sub-blocks spread it over
     // more threads (and keep one block from running alone at the end)
     let sub = if arr != 0 && !crate::sys::dev_flag("NZ_SUB") { sub_size(data.len(), threads, code).min(FAST_SUB) } else { sub_size(data.len(), threads, code) };
-    let parts: Vec<(usize, &[u8])> =
-        if data.is_empty() { vec![(0, data)] } else { data.chunks(sub).enumerate().map(|(i, c)| (i * sub, c)).collect() };
+    let parts: Vec<(usize, &[u8])> = piece_cuts(data, sub, threads).windows(2).map(|w| (w[0], &data[w[0]..w[1]])).collect();
     let code_part = |base: usize, p: &[u8], pre: Option<Lists>| -> Vec<u8> {
+        let gpu = pre.is_some();
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let t0 = T0.get_or_init(std::time::Instant::now);
+        let ts = t0.elapsed().as_secs_f64();
         let d0 = dict_len(base);
         let n = d0 + p.len();
         crate::par::with_memory(mem_for(n), || {
@@ -1699,6 +1833,9 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
                 encode_one(&buf, n, d0, b0, x86ctx, arr)
             };
             crate::progress::work(p.len());
+            if crate::sys::dev_flag("NZ_WTRACE") {
+                eprintln!("  enc piece {:>3} MB @{:>4} of {:>4} gpu {} {ts:.2}-{:.2}s", p.len() >> 20, base >> 20, data.len() >> 20, gpu as u8, t0.elapsed().as_secs_f64());
+            }
             c
         })
     };
@@ -1706,13 +1843,20 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     // history) in one job, and its sub-blocks take their part. Without a GPU every
     // sub-block runs its own CPU match finder.
     // A chunk takes the GPU or the CPU match finder, whichever is expected to be done first.
-    let groups: Vec<&[(usize, &[u8])]> = parts.chunks((GPU_CHUNK / sub).max(1)).collect();
+    let mut groups: Vec<&[(usize, &[u8])]> = Vec::new();
+    let mut g0 = 0;
+    for i in 0..parts.len() {
+        if i + 1 == parts.len() || parts[i + 1].0 + parts[i + 1].1.len() - parts[g0].0 > GPU_CHUNK {
+            groups.push(&parts[g0..=i]);
+            g0 = i + 1;
+        }
+    }
     let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |group| {
         let c0 = group[0].0;
         let c1 = group[group.len() - 1].0 + group[group.len() - 1].1.len();
         let w0 = c0 - dict_len(c0);
-        let step = if arr != 0 || effort(0) == 1 { 4 } else { 2 };
-        let cpu_bytes = dict_len(c0) / step + sub.min(c1 - c0);
+        let step = crate::sys::dev_var("NZ_HSTEP").and_then(|v| v.parse().ok()).unwrap_or(if arr != 0 || effort(0) == 1 { 4 } else { 2 });
+        let cpu_bytes = dict_len(c0) / step + group.iter().map(|g| g.1.len()).max().unwrap_or(0);
         let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || c1 - c0 < 2 * PSEG || !gpu_turn(c1 - w0, cpu_bytes) {
             None
         } else {
@@ -1739,9 +1883,9 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     .flatten()
     .collect();
     let mut out = Vec::with_capacity(coded.iter().map(|c| c.len()).sum::<usize>() + 8 * coded.len());
-    crate::container::write_varint(&mut out, sub as u64);
     crate::container::write_varint(&mut out, coded.len() as u64);
-    for c in &coded {
+    for (c, p) in coded.iter().zip(&parts) {
+        crate::container::write_varint(&mut out, p.1.len() as u64);
         crate::container::write_varint(&mut out, c.len() as u64);
     }
     for c in coded {
@@ -1753,35 +1897,49 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
 pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<u8>, String> {
     let e = || "corrupt LZ block".to_string();
     let mut r = src;
-    let sub = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
-    if sub == 0 || sub > (256 << 20) {
-        return Err(e());
-    }
     let k = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
-    if k != n.div_ceil(sub).max(1) {
+    if k == 0 || k > n.div_ceil(1 << SEG_BITS).max(1) {
         return Err(e());
     }
     let mut lens = Vec::with_capacity(k);
     for _ in 0..k {
-        lens.push(crate::container::read_varint(&mut r).map_err(|_| e())? as usize);
+        let raw = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
+        let comp = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
+        lens.push((raw, comp));
+    }
+    if lens.iter().map(|l| l.0).try_fold(0usize, |a, l| a.checked_add(l)) != Some(n) || lens.iter().any(|l| l.0 > SUB_BLOCK) {
+        return Err(e());
+    }
+    if crate::sys::dev_flag("NZ_DTRACE") {
+        eprintln!("  lz decode: {} MB in {} pieces", n >> 20, k);
     }
     let mut jobs = Vec::with_capacity(k);
-    let mut off = 0usize;
-    for (i, &l) in lens.iter().enumerate() {
-        let s = r.get(off..off + l).ok_or_else(e)?;
-        off += l;
-        jobs.push((s, sub.min(n - (i * sub).min(n)), i * sub));
+    let (mut off, mut base) = (0usize, 0usize);
+    for &(raw, comp) in &lens {
+        let s = r.get(off..off.checked_add(comp).ok_or_else(e)?).ok_or_else(e)?;
+        off += comp;
+        jobs.push((s, raw, base));
+        base += raw;
     }
     // pass 1: every sub-block at once (history read as zeros)
-    let parts = crate::par::map(&jobs, threads, |&(s, len, base)| {
+    let parts = crate::par::map_ranked(&jobs, threads, |j| j.0.len() as u64 + (j.1 >> 4) as u64, |&(s, len, base)| {
         let d0 = dict_len(base);
         crate::par::with_memory(2 * (d0 + len) as u64 + (24 << 20), || {
+            let tr = crate::sys::dev_flag("NZ_DTRACE");
+            static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let t0 = T0.get_or_init(std::time::Instant::now);
+            let a = t0.elapsed().as_secs_f64();
             let d = decode_one(s, len, d0, base - d0, x86ctx);
+            if tr {
+                eprintln!("  piece {:>4} MB @{:>4} MB of {:>4}: comp {:>6} KB {a:.2}-{:.2}s {:.3}", len >> 20, base >> 20, n >> 20, s.len() >> 10, t0.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64() - a);
+            }
             crate::progress::work(len);
             d
         })
     });
     // pass 2, in order: the copies that reached into earlier sub-blocks
+    let tp = std::time::Instant::now();
+    let mut nfix = 0usize;
     let mut out = Vec::with_capacity(n);
     for p in parts {
         let (bytes, fix) = p?;
@@ -1790,13 +1948,21 @@ pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<
         for &(pos, d, len) in &fix {
             let dst = at + pos as usize;
             let d = d as usize;
-            if d > dst || dst + len as usize > out.len() {
+            if d == 0 || d > dst || dst + len as usize > out.len() {
                 return Err(e());
             }
-            for k in dst..dst + len as usize {
-                out[k] = out[k - d];
+            // in steps of at most `d` bytes: an overlapping copy repeats its own output
+            let (mut k, end) = (dst, dst + len as usize);
+            while k < end {
+                let m = (end - k).min(d);
+                out.copy_within(k - d..k - d + m, k);
+                k += m;
             }
+            nfix += len as usize;
         }
+    }
+    if crate::sys::dev_flag("NZ_DTRACE") {
+        eprintln!("  pass 2 of {} MB: {} KB fixed in {:.3}s", n >> 20, nfix >> 10, tp.elapsed().as_secs_f64());
     }
     Ok(out)
 }

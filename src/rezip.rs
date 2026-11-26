@@ -247,7 +247,8 @@ pub fn restore(data: &[u8], recs: &[Rec], raw_len: usize, threads: usize) -> Res
         spans.push((at, end, r.params));
         at = end;
     }
-    let comp: Vec<Vec<u8>> = crate::par::map(&spans, threads, |&(s, t, p)| crate::zlib::deflate(&data[s..t], p & 15, p >> 4));
+    // biggest streams first (they share one queue with the other blocks' work)
+    let comp: Vec<Vec<u8>> = crate::par::map_ranked(&spans, threads, |&(s, t, _)| (t - s) as u64, |&(s, t, p)| crate::zlib::deflate(&data[s..t], p & 15, p >> 4));
     let mut out = Vec::with_capacity(raw_len);
     let mut at = 0;
     for ((r, &(s, t, _)), c) in recs.iter().zip(&spans).zip(&comp) {

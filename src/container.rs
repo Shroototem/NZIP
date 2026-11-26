@@ -22,7 +22,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 8;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -484,7 +484,10 @@ fn unpack_lrm(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Strin
     if lits.len() != n {
         return Err(e());
     }
-    crate::lrm::join(&table, &lits, raw_len)
+    let t = std::time::Instant::now();
+    let r = crate::lrm::join(&table, &lits, raw_len);
+    trace(&format!("lrm join {:.3}s", t.elapsed().as_secs_f64()), raw_len);
+    r
 }
 
 fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
@@ -584,6 +587,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     par::pipeline(
         workers,
         workers,
+        true,
         || {
             if eof {
                 return Ok(None);
@@ -720,6 +724,7 @@ fn unpack_payload(kind: u8, data: &[u8], raw_len: usize, threads: usize) -> Resu
 
 fn unpack_block(b: &Raw, threads: usize) -> io::Result<Vec<u8>> {
     let out = unpack_payload(b.kind, &b.data, b.raw_len, threads).map_err(|e| bad(&e))?;
+    trace("payload done", b.raw_len);
     if out.len() != b.raw_len || crate::codec::crc32_par(&out, threads) != b.crc {
         return Err(bad("CRC mismatch: archive is corrupt"));
     }
@@ -730,12 +735,15 @@ fn unpack_block(b: &Raw, threads: usize) -> io::Result<Vec<u8>> {
 pub fn decompress<R: Read, W: Write>(mut input: R, h: &Header, mut out: W, threads: usize) -> io::Result<u64> {
     let bs = h.block_size as usize;
     let threads = threads.max(1);
-    let workers = fit_threads(threads, block_mem(h.mode, bs));
+    // block workers only queue work (CPU tokens limit the threads that run), so more blocks
+    // than threads may start, as memory allows: every block's pieces are known early
+    let workers = fit_threads(4 * threads, block_mem(h.mode, bs));
     let mut written = 0u64;
     let mut done = false;
     par::pipeline(
         workers,
         workers * 2,
+        false,
         || {
             if done {
                 return Ok(None);
