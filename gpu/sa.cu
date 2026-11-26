@@ -558,12 +558,26 @@ extern "C" __global__ void mf_find(const unsigned char* __restrict__ s, const u3
 }
 
 // Number of pairs each position keeps (0 inside skipped segments).
+// Position t lies inside a match of at least MF_RUN bytes found at t - 1: the parser takes
+// such matches whole, so t only needs that match's continuation (the CPU match finder
+// does the same). Positions at the start of a pass keep their full lists.
+#define MF_RUN 128u
+__device__ __forceinline__ bool mf_in_run(const u32* __restrict__ out, u32 t) {
+    if (t == 0) return false;
+    const u32* q = out + (u64)(t - 1) * (1 + 2 * MF_C);
+    u32 c = q[0] < MF_C ? q[0] : MF_C;
+    // the match must lie within the LZ history every sub-block sees (lzx.rs DICT, 16 MB):
+    // a farther one may be dropped by the sub-block, which would then have no match here
+    return c > 0 && q[1 + 2 * (c - 1)] >= MF_RUN && q[2 + 2 * (c - 1)] < (16u << 20);
+}
+
 extern "C" __global__ void mf_count(const u32* __restrict__ out, const unsigned char* __restrict__ skip,
                                     u32 seg_bits, u32 p0, u32 cnt, u32* counts, unsigned char* c8) {
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= cnt) return;
     u32 c = out[(u64)t * (1 + 2 * MF_C)];
     c = skip[(p0 + t) >> seg_bits] ? 0u : (c < MF_C ? c : MF_C);
+    if (c && mf_in_run(out, t)) c = 1u;
     counts[t] = c;
     c8[t] = (unsigned char)c;
 }
@@ -575,6 +589,14 @@ extern "C" __global__ void mf_pack(const u32* __restrict__ out, const u32* __res
     if (t >= cnt) return;
     const u32* o = out + (u64)t * (1 + 2 * MF_C);
     u32 k = counts[t], at = offs[t];
+    if (k && mf_in_run(out, t)) {
+        // inside a long match: only its continuation (same distance, one byte shorter)
+        const u32* q = out + (u64)(t - 1) * (1 + 2 * MF_C);
+        u32 c = q[0] < MF_C ? q[0] : MF_C;
+        packed[2 * at] = q[1 + 2 * (c - 1)] - 1u;
+        packed[2 * at + 1] = q[2 + 2 * (c - 1)];
+        return;
+    }
     for (u32 j = 0; j < k; j++) {
         packed[2 * (at + j)] = o[1 + 2 * j];
         packed[2 * (at + j) + 1] = o[2 + 2 * j];

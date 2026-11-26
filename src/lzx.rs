@@ -21,7 +21,7 @@ pub const SUB_BLOCK: usize = 64 << 20;
 /// History each sub-block may match into from the sub-blocks before it. Decoding stays
 /// parallel: a first pass decodes every sub-block at once with bytes from before it read
 /// as zero (the encoder models the same view), a second, sequential pass copies them in.
-const DICT: usize = 16 << 20;
+pub const DICT: usize = 16 << 20;
 
 /// Bytes of history before sub-block start `base`.
 #[inline]
@@ -74,11 +74,13 @@ static ARRIVALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// finishes well ahead of 7-Zip Ultra. 7-Zip codes 256 MB blocks with one LZMA coder per
 /// two threads at about 5 MB/s each, so it is slow on small inputs and uses every core
 /// on big ones; nzip parses at about 0.8 / 1.2 / 1.5 MB/s per thread with 4 / 2 / 1
-/// arrivals on the CPU alone (a GPU only adds speed).
-pub fn set_effort(threads: usize, bytes: u64) {
+/// arrivals when a GPU finds the matches, 0.65 / 0.9 / 1.2 on the CPU alone.
+pub fn set_effort(threads: usize, bytes: u64, gpu: bool) {
     let coders = (threads / 2).max(1).min(bytes.div_ceil(256 << 20).max(1) as usize);
     let rival = coders as f64 * 5.0;
-    let ours = |a: usize| threads as f64 * if a == 4 { 0.8 } else if a == 2 { 1.2 } else { 1.5 };
+    // without a GPU the CPU also finds the matches
+    let rate = if gpu { [0.8, 1.2, 1.5] } else { [0.65, 0.9, 1.2] };
+    let ours = |a: usize| threads as f64 * if a == 4 { rate[0] } else if a == 2 { rate[1] } else { rate[2] };
     let a = [4, 2, 1].into_iter().find(|&a| ours(a) >= rival * 1.1).unwrap_or(1);
     ARRIVALS.store(a, std::sync::atomic::Ordering::Relaxed);
 }
@@ -100,7 +102,7 @@ fn arrivals() -> usize {
 /// 256 KiB - 64 MiB. Dev override: NZ_SUB in MiB.
 fn sub_size(n: usize, threads: usize, code: bool) -> usize {
     if let Some(v) = crate::sys::dev_var("NZ_SUB").and_then(|v| v.parse::<usize>().ok()) {
-        return (v << 20).clamp(1 << 20, SUB_BLOCK);
+        return (v << 20).clamp(1 << 20, 256 << 20);
     }
     let share = match SHARE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => n.div_ceil(threads.max(1)),
@@ -698,8 +700,8 @@ fn match_len_from(buf: &[u8], a: usize, b: usize, start: usize, limit: usize) ->
 }
 
 impl Mf {
-    fn new(n: usize) -> Mf {
-        Mf { depth: DEPTH, nice: NICE, head4: vec![0; 1 << H4_BITS], head3: vec![0; 1 << H3_BITS], son: vec![0; 2 * n] }
+    fn new(n: usize, depth: usize) -> Mf {
+        Mf { depth, nice: NICE, head4: vec![0; 1 << H4_BITS], head3: vec![0; 1 << H3_BITS], son: vec![0; 2 * n] }
     }
 
     #[inline(always)]
@@ -796,10 +798,10 @@ impl Mf {
     }
 
     /// Inserts the history bytes [0, d0) (except dense segments).
-    fn insert_history(&mut self, buf: &[u8], n: usize, d0: usize, flags: &[bool]) {
-        // every second position: matches into history start at most one byte later,
-        // for half the work
-        for p in (0..d0).step_by(2) {
+    fn insert_history(&mut self, buf: &[u8], n: usize, d0: usize, flags: &[bool], step: usize) {
+        // every `step`-th position: matches into history start at most step - 1 bytes
+        // later, for a fraction of the work
+        for p in (0..d0).step_by(step) {
             if !flags[p >> SEG_BITS] {
                 self.walk(buf, n, p, None);
             }
@@ -1391,8 +1393,11 @@ fn encode_sub_mt(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, thr
             if on_gpu {
                 return;
             }
-            let mut mf = Mf::new(n);
-            mf.insert_history(buf, n, d0, fl);
+            // effort-capped streams also search less
+            // lower effort also searches less: capped streams much less
+            let mut mf = Mf::new(n, if arr != 0 { DEPTH / 8 } else if effort(0) < 4 { DEPTH / 2 } else { DEPTH });
+            let step = if arr != 0 || effort(0) == 1 { 4 } else { 2 };
+            mf.insert_history(buf, n, d0, fl, step);
             for &(s, e) in sg {
                 if tx.send(find_lists(&mut mf, buf, n, fl, s, e)).is_err() {
                     return;
@@ -1448,13 +1453,13 @@ fn encode_sub(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool, arr: u
 
 fn encode_sub_a<const A: usize>(buf: &[u8], n: usize, d0: usize, base: usize, x86ctx: bool) -> Vec<u8> {
     let mut m = Model::new(base, x86ctx);
-    let mut mf = Mf::new(n);
+    let mut mf = Mf::new(n, DEPTH);
     let mut parser = Parser::<A>::new();
     let mut enc = Encoder::new((n - d0) / 3 + 64);
     let mut toks = Vec::with_capacity(WIN);
     let mut view = View::new(n, d0);
     m.flags = dense_segments(&buf[..n]);
-    mf.insert_history(buf, n, d0, &m.flags);
+    mf.insert_history(buf, n, d0, &m.flags, 2);
     let mut pos = d0;
     while pos < n {
         let seg = pos >> SEG_BITS;
@@ -1616,12 +1621,16 @@ pub fn encode(data: &[u8], threads: usize, x86ctx: bool, code: bool, arr: usize)
     // chunks of sub-blocks run at once; the GPU finds each chunk's match lists (with its
     // history) in one job, and its sub-blocks take their part. Without a GPU every
     // sub-block runs its own CPU match finder.
-    let groups: Vec<&[(usize, &[u8])]> = parts.chunks((GPU_CHUNK / sub).max(1)).collect();
-    let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |group| {
+    // Effort-capped streams (bulk data such as inflated zip entries) parse so fast that the
+    // GPU becomes the bottleneck while cores sit idle: every second chunk then uses the CPU
+    // match finder (a fixed split, so the archive does not depend on timing).
+    let groups: Vec<(usize, &[(usize, &[u8])])> = parts.chunks((GPU_CHUNK / sub).max(1)).enumerate().collect();
+    let coded: Vec<Vec<u8>> = crate::par::map(&groups, threads, |&(gi, group)| {
         let c0 = group[0].0;
         let c1 = group[group.len() - 1].0 + group[group.len() - 1].1.len();
         let w0 = c0 - dict_len(c0);
-        let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || c1 - c0 < 2 * PSEG {
+        let cpu_turn = arr != 0 && gi % 2 == 1;
+        let lists = if crate::sys::dev_flag("NZ_NOGPUMF") || cpu_turn || c1 - c0 < 2 * PSEG {
             None
         } else {
             let skip: Vec<bool> = dense_segments(&data[w0..c1]).iter().enumerate().map(|(i, &f)| f || (i + 1) << SEG_BITS <= c0 - w0).collect();
@@ -1648,7 +1657,7 @@ pub fn decode(src: &[u8], n: usize, threads: usize, x86ctx: bool) -> Result<Vec<
     let e = || "corrupt LZ block".to_string();
     let mut r = src;
     let sub = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
-    if sub == 0 || sub > SUB_BLOCK {
+    if sub == 0 || sub > (256 << 20) {
         return Err(e());
     }
     let k = crate::container::read_varint(&mut r).map_err(|_| e())? as usize;
@@ -1737,7 +1746,7 @@ mod perf {
         let t = std::time::Instant::now();
         let mut pb = buf.to_vec();
         pb.resize(buf.len() + super::NICE + 8, 0);
-        let mut mf = super::Mf::new(buf.len());
+        let mut mf = super::Mf::new(buf.len(), DEPTH);
         let mut out = Vec::new();
         let mut cnt = 0usize;
         for p in 0..buf.len() {

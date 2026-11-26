@@ -244,6 +244,66 @@ pub struct PackReader {
     left: u64,
 }
 
+/// Inside a big ELF file (program, library, object), the offsets in its stream bytes
+/// where the kind of section changes (code / strings / other data): blocks may end there,
+/// so string tables and code get the engine that suits them. `ranges` = the file's
+/// stream ranges (offset, length).
+fn elf_cuts(p: &Path, ranges: &[(u64, u64)]) -> Vec<u64> {
+    let mut f = match File::open(p) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut h = [0u8; 64];
+    if read_full(&mut f, &mut h).unwrap_or(0) < 64 || &h[..4] != b"\x7fELF" || h[4] != 2 || h[5] != 1 {
+        return Vec::new();
+    }
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u64;
+    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let (shoff, shentsize, shnum) = (u64_at(&h, 0x28), u16_at(&h, 0x3a), u16_at(&h, 0x3c));
+    if shentsize < 64 || shnum == 0 || shnum > 1 << 16 {
+        return Vec::new();
+    }
+    let mut t = vec![0u8; (shentsize * shnum) as usize];
+    if f.seek(io::SeekFrom::Start(shoff)).is_err() || read_full(&mut f, &mut t).unwrap_or(0) < t.len() {
+        return Vec::new();
+    }
+    // (file offset, kind): 0 code, 1 strings, 2 other
+    let mut secs: Vec<(u64, u8)> = (0..shnum as usize)
+        .filter_map(|i| {
+            let b = &t[i * shentsize as usize..];
+            let typ = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            let (flags, off, size) = (u64_at(b, 8), u64_at(b, 24), u64_at(b, 32));
+            if typ == 8 || size < 1 << 20 {
+                return None; // no bytes in the file, or too small to matter
+            }
+            Some((off, if flags & 4 != 0 { 0 } else if typ == 3 || flags & 0x20 != 0 { 1 } else { 2 }))
+        })
+        .collect();
+    secs.sort_unstable();
+    let mut out = Vec::new();
+    let mut prev = u8::MAX;
+    for (off, kind) in secs {
+        if kind != prev && prev != u8::MAX {
+            // file offset -> offset in the file's stream bytes (only inside literal ranges)
+            let mut at = 0;
+            for &(ro, rl) in ranges {
+                if off >= ro && off < ro + rl {
+                    if off > 0 {
+                        out.push(at + off - ro);
+                    }
+                    break;
+                }
+                at += rl;
+            }
+        }
+        prev = kind;
+    }
+    out
+}
+
+/// ELF files at least this big get block cuts where their section kind changes.
+const ELF_SPLIT: u64 = 64 << 20;
+
 /// Files at least this big and without an extension get blocks of their own.
 const BIG_FILE: u64 = 4 << 20;
 
@@ -272,6 +332,13 @@ impl PackReader {
                 let big = size >= BIG_FILE;
                 let alone = x.is_empty() && (big || prev_big);
                 cuts.push((off, alone || prev_ext.as_ref().is_some_and(|p| *p != x)));
+                // huge programs: blocks follow their sections (smaller files stay whole, so
+                // similar files share blocks)
+                if size >= ELF_SPLIT {
+                    for c in elf_cuts(&e.path, &r) {
+                        cuts.push((off + c, true));
+                    }
+                }
                 prev_ext = Some(x);
                 prev_big = big;
             }

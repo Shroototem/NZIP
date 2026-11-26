@@ -7,6 +7,9 @@
 //! BWT payload : flags:u8 (1 = word transform, 2 = x86 filter) bwt_len:varint idx[k]:u32le coder-stream
 //! LZ payload  : lz-stream (fast mode)
 //! LZX payload : flags:u8 (1 = x86 split) [4 raw lens, 4 comp lens] lzx stream(s) (max mode, binary)
+//! LRM payload : table_len:varint packed_len:varint long-range copy table (lrm.rs, LZX
+//!               coded), inner kind:u8
+//!               inner raw_len:varint, inner payload (the bytes left after the copies)
 //! MIX payload : table_len:varint piece-table, then 2 parts (text, binary), each
 //!               kind:u8 raw_len:varint comp_len:varint payload
 //! ```
@@ -19,7 +22,7 @@ use crate::par;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"NZIP";
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 pub const FLAG_DIR: u8 = 1;
 
 const KIND_END: u8 = 0;
@@ -29,6 +32,7 @@ const KIND_LZ: u8 = 5;
 const KIND_LZX: u8 = 6;
 const KIND_MIX: u8 = 7;
 const KIND_REZIP: u8 = 8;
+const KIND_LRM: u8 = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -412,6 +416,24 @@ fn pack_plain(data: &[u8], threads: usize, arr: usize) -> (u8, Vec<u8>, &'static
         }
         return (KIND_BWT, bwt_payload(data, 0, threads), "bwt");
     }
+    // repeats further back than the LZ engine reaches become copies first
+    if let Some((table, lits)) = crate::lrm::split(data, crate::lzx::DICT) {
+        let (kind, payload, note) = pack_bin(&lits, threads, arr);
+        let tz = crate::lzx::encode(&table, threads, false, false, 0);
+        let mut out = Vec::with_capacity(tz.len() + payload.len() + 16);
+        write_varint(&mut out, table.len() as u64);
+        write_varint(&mut out, tz.len() as u64);
+        out.extend_from_slice(&tz);
+        out.push(kind);
+        write_varint(&mut out, lits.len() as u64);
+        out.extend_from_slice(&payload);
+        return (KIND_LRM, out, note);
+    }
+    pack_bin(data, threads, arr)
+}
+
+/// Binary data: x86 filter if it is machine code, then the LZ or the BWT engine.
+fn pack_bin(data: &[u8], threads: usize, arr: usize) -> (u8, Vec<u8>, &'static str) {
     let x86 = crate::x86::looks_like_x86(data);
     let bwt_full = |d: &[u8]| -> Vec<u8> {
         if x86 {
@@ -432,12 +454,37 @@ fn pack_plain(data: &[u8], threads: usize, arr: usize) -> (u8, Vec<u8>, &'static
     let s = sample_of(data);
     let tried = par::map(&[false, true], 2, |&lz| if lz { lz_payload(&s, x86, threads, arr).len() } else { bwt_full(&s).len() });
     let (sb, sl) = (tried[0], tried[1]);
-    trace(if sl <= sb { "engine: lz" } else { "engine: bwt" }, data.len());
-    if sl <= sb {
+    trace(&format!("engine trial: bwt {sb} lz {sl}"), data.len());
+    // a small sample cuts LZ off from its long-range matches (BWT barely needs them), so
+    // on binary data BWT must win clearly
+    let margin = if crate::dedup::texty(&s) { 100 } else { 85 };
+    if sb * 100 >= sl * margin {
         (KIND_LZX, lz_payload(data, x86, threads, arr), if x86 { "x86+lz" } else { "lz" })
     } else {
         (KIND_BWT, bwt_full(data), if x86 { "x86+bwt" } else { "bwt" })
     }
+}
+
+fn unpack_lrm(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
+    let e = || "corrupt long-range block".to_string();
+    let mut r = p;
+    let tl = read_varint(&mut r).map_err(|_| e())? as usize;
+    let tz = read_varint(&mut r).map_err(|_| e())? as usize;
+    if tl > raw_len {
+        return Err(e());
+    }
+    let table = crate::lzx::decode(r.get(..tz).ok_or_else(e)?, tl, threads, false)?;
+    r = &r[tz..];
+    let kind = read_u8(&mut r).map_err(|_| e())?;
+    let n = read_varint(&mut r).map_err(|_| e())? as usize;
+    if n > raw_len || kind == KIND_LRM {
+        return Err(e());
+    }
+    let lits = unpack_payload(kind, r, n, threads)?;
+    if lits.len() != n {
+        return Err(e());
+    }
+    crate::lrm::join(&table, &lits, raw_len)
 }
 
 fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String> {
@@ -530,7 +577,7 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     // LZ sub-blocks are sized from the work in flight per thread (fixed for the run, so
     // the output does not depend on timing)
     crate::lzx::set_share(((workers * bs) as u64).min(total.max(1)).div_ceil(threads as u64) as usize);
-    crate::lzx::set_effort(threads, total);
+    crate::lzx::set_effort(threads, total, o.mode == Mode::Max && total >= 32 << 20 && crate::gpu::free_vram().is_some());
     let mut eof = false;
     let mut nblock = 0usize;
     let verbose = o.verbose;
@@ -666,6 +713,7 @@ fn unpack_payload(kind: u8, data: &[u8], raw_len: usize, threads: usize) -> Resu
         KIND_LZX => unpack_lz(data, raw_len, threads),
         KIND_MIX => unpack_mix(data, raw_len, threads),
         KIND_REZIP => unpack_rezip(data, raw_len, threads),
+        KIND_LRM => unpack_lrm(data, raw_len, threads),
         _ => Err("unknown block kind".into()),
     }
 }

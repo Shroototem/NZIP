@@ -8,6 +8,7 @@ mod coder;
 mod container;
 mod dedup;
 mod gpu;
+mod lrm;
 mod lz;
 mod lzx;
 mod mix;
@@ -178,7 +179,10 @@ fn run(a: Args) -> io::Result<()> {
                 dup_bytes = archive::find_dups(&mut entries, opts.threads)?;
                 let rep = archive::find_repeats(&mut entries, opts.threads)?;
                 if opts.verbose {
-                    eprintln!("  duplicate files: {dup_bytes} bytes; repeated pieces: {rep} bytes (copied, not compressed)");
+                    eprintln!(
+                        "  duplicate files: {dup_bytes} bytes; repeated pieces: {rep} bytes (copied, not compressed) [{:.2}s]",
+                        t0.elapsed().as_secs_f64()
+                    );
                 }
                 dup_bytes += rep;
                 let (r, total, cuts) = archive::PackReader::new(&entries);
