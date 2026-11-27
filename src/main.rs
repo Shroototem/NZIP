@@ -53,6 +53,9 @@ OPTIONS:
   -p            show a progress bar
   -b SIZE       block size, e.g. 64M (default: automatic from cores, free RAM and VRAM)
   --gpu PCT     share of free GPU memory to use, 0-100 (default 99; 0 = CPU only)
+  --priority P  low (default), idle or normal: how much nzip yields the CPU and
+                disk to other programs; low keeps the desktop responsive and costs
+                nothing on an idle machine
   --ram PCT     share of free RAM to use, 1-100 (default 99); fewer blocks run at once
                 when it is low
   -m SIZE       exact memory budget, e.g. 4G (overrides --ram)
@@ -70,6 +73,7 @@ struct Args {
     block: Option<usize>,
     force: bool,
     verbose: bool,
+    priority: sys::Priority,
 }
 
 fn parse_size(s: &str) -> Option<usize> {
@@ -94,6 +98,7 @@ fn parse() -> Result<Args, String> {
         block: None,
         force: false,
         verbose: false,
+        priority: sys::Priority::Low,
     };
     let mut cpu_pct = 99usize;
     let set_cmd = |a: &mut Args, c: &str| -> Result<(), String> {
@@ -119,6 +124,14 @@ fn parse() -> Result<Args, String> {
             "--gpu" => {
                 let p: u64 = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| *p <= 100).ok_or("--gpu needs a percentage 0-100")?;
                 gpu::set_share(p);
+            }
+            "--priority" => {
+                a.priority = match it.next().as_deref() {
+                    Some("low") => sys::Priority::Low,
+                    Some("idle") => sys::Priority::Idle,
+                    Some("normal") => sys::Priority::Normal,
+                    _ => return Err("--priority needs low, idle or normal".into()),
+                }
             }
             "--ram" => {
                 let p: u64 = it.next().and_then(|v| v.trim_end_matches('%').parse().ok()).filter(|p| (1..=100).contains(p)).ok_or("--ram needs a percentage 1-100")?;
@@ -173,7 +186,7 @@ fn run(a: Args) -> io::Result<()> {
             let (guard, file) = outfile::OutFile::create(&out_path, a.force)?;
             let mut out = BufWriter::with_capacity(1 << 20, file);
             let mut dup_bytes = 0u64;
-            let (src, total, flags, cuts): (Box<dyn io::Read>, u64, u8, Vec<(u64, bool)>) = if input.is_dir() {
+            let (src, total, flags, cuts): (Box<dyn container::Source>, u64, u8, Vec<(u64, bool)>) = if input.is_dir() {
                 // never pack the archive being written, wherever -o puts it
                 let mut entries = archive::scan(&input, Some(guard.temp_path()))?;
                 dup_bytes = archive::find_dups(&mut entries, opts.threads)?;
@@ -185,7 +198,7 @@ fn run(a: Args) -> io::Result<()> {
                     );
                 }
                 dup_bytes += rep;
-                let (r, total, cuts) = archive::PackReader::new(&entries);
+                let (r, total, cuts) = archive::PackSource::new(&entries);
                 (Box::new(r), total, FLAG_DIR, cuts)
             } else {
                 let f = File::open(&input)?;
@@ -193,9 +206,13 @@ fn run(a: Args) -> io::Result<()> {
                 (Box::new(f), total, 0, Vec::new())
             };
             let bar = progress::start("compressing", total, a.progress);
-            let st = container::compress(BufReader::with_capacity(1 << 20, src), total, flags, &mut out, &opts, &cuts)?;
+            let st = container::compress(&*src, total, flags, &mut out, &opts, &cuts)?;
+            let ts = Instant::now();
             out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             guard.commit()?;
+            if sys::dev_flag("NZ_BT") {
+                eprintln!("sync+commit {:.3}s, done at {:.3}s", ts.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
+            }
             drop(bar);
             let dt = t0.elapsed().as_secs_f64();
             // real input size: duplicate files count although they are stored once
@@ -259,7 +276,7 @@ fn run(a: Args) -> io::Result<()> {
             let data = std::fs::read(&input)?;
             let t0 = Instant::now();
             let mut comp = Vec::new();
-            let st = container::compress(&data[..], data.len() as u64, 0, &mut comp, &opts, &[])?;
+            let st = container::compress(&data, data.len() as u64, 0, &mut comp, &opts, &[])?;
             let tc = t0.elapsed().as_secs_f64();
             let t1 = Instant::now();
             let mut r = &comp[..];
@@ -315,6 +332,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    sys::set_priority(a.priority);
     let verbose = a.verbose;
     par::set_threads(a.threads);
     #[cfg(feature = "tune")]

@@ -234,14 +234,13 @@ fn stream_ranges(e: &Entry) -> Vec<(u64, u64)> {
     }
 }
 
-/// Reader over manifest + every file's bytes.
-pub struct PackReader {
-    head: io::Cursor<Vec<u8>>,
-    files: std::vec::IntoIter<(PathBuf, Vec<(u64, u64)>)>,
-    /// open file and its ranges still to read
-    cur: Option<(File, std::vec::IntoIter<(u64, u64)>)>,
-    /// bytes left in the range being read
-    left: u64,
+/// The packed stream (manifest, then every file's literal bytes), readable at any offset
+/// from any thread.
+pub struct PackSource {
+    head: Vec<u8>,
+    paths: Vec<PathBuf>,
+    /// (stream offset, file, offset in the file, length), in stream order
+    ext: Vec<(u64, u32, u64, u64)>,
 }
 
 /// Inside a big ELF file (program, library, object), the offsets in its stream bytes
@@ -307,11 +306,11 @@ const ELF_SPLIT: u64 = 64 << 20;
 /// Files at least this big and without an extension get blocks of their own.
 const BIG_FILE: u64 = 4 << 20;
 
-impl PackReader {
+impl PackSource {
     /// Returns the reader, the stream length, and preferred block cut points: every file
     /// start, flagged where the extension group changes (and around big files without an
     /// extension).
-    pub fn new(entries: &[Entry]) -> (PackReader, u64, Vec<(u64, bool)>) {
+    pub fn new(entries: &[Entry]) -> (PackSource, u64, Vec<(u64, bool)>) {
         let m = manifest(entries);
         let mut head = (m.len() as u64).to_le_bytes().to_vec();
         head.extend_from_slice(&m);
@@ -321,7 +320,8 @@ impl PackReader {
         let mut off = head.len() as u64;
         let mut prev_ext: Option<String> = None;
         let mut prev_big = false;
-        let mut list = Vec::with_capacity(files.len());
+        let mut paths = Vec::with_capacity(files.len());
+        let mut exts = Vec::with_capacity(files.len());
         for e in &files {
             let x = ext(e);
             let r = stream_ranges(e);
@@ -342,44 +342,49 @@ impl PackReader {
                 prev_ext = Some(x);
                 prev_big = big;
             }
+            let mut at = off;
+            for &(o, l) in r.iter().filter(|q| q.1 > 0) {
+                exts.push((at, paths.len() as u32, o, l));
+                at += l;
+            }
             off += size;
-            list.push((e.path.clone(), r));
+            paths.push(e.path.clone());
         }
         let total = off;
-        (PackReader { head: io::Cursor::new(head), files: list.into_iter(), cur: None, left: 0 }, total, cuts)
+        (PackSource { head, paths, ext: exts }, total, cuts)
     }
 }
 
-impl Read for PackReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.head.read(buf)?;
-        if n > 0 {
-            return Ok(n);
+impl crate::container::Source for PackSource {
+    fn read_at(&self, mut off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut done = 0;
+        if off < self.head.len() as u64 {
+            let h = &self.head[off as usize..];
+            let k = h.len().min(buf.len());
+            buf[..k].copy_from_slice(&h[..k]);
+            done = k;
+            off += k as u64;
         }
-        loop {
-            if self.left > 0 {
-                let f = &mut self.cur.as_mut().unwrap().0;
-                let k = (buf.len() as u64).min(self.left) as usize;
-                let n = f.read(&mut buf[..k])?;
-                if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "a file shrank while being read"));
-                }
-                self.left -= n as u64;
-                return Ok(n);
+        let mut open: Option<(u32, File)> = None;
+        let mut k = self.ext.partition_point(|e| e.0 <= off).saturating_sub(1);
+        while done < buf.len() {
+            let &(at, fi, fo, len) = self.ext.get(k).ok_or(io::ErrorKind::UnexpectedEof)?;
+            let inside = off - at;
+            let n = ((len - inside) as usize).min(buf.len() - done);
+            let p = &self.paths[fi as usize];
+            let named = |e: io::Error| {
+                let what = if e.kind() == io::ErrorKind::UnexpectedEof { "the file shrank while being read".to_string() } else { e.to_string() };
+                io::Error::new(e.kind(), format!("{}: {what}", p.display()))
+            };
+            if open.as_ref().is_none_or(|o| o.0 != fi) {
+                open = Some((fi, File::open(p).map_err(named)?));
             }
-            if let Some((f, ranges)) = &mut self.cur {
-                if let Some((off, len)) = ranges.next() {
-                    f.seek(io::SeekFrom::Start(off))?;
-                    self.left = len;
-                    continue;
-                }
-                self.cur = None;
-            }
-            match self.files.next() {
-                Some((p, ranges)) => self.cur = Some((File::open(&p)?, ranges.into_iter())),
-                None => return Ok(0),
-            }
+            crate::sys::read_at(&open.as_ref().unwrap().1, &mut buf[done..done + n], fo + inside).map_err(named)?;
+            done += n;
+            off += n as u64;
+            k += 1;
         }
+        Ok(())
     }
 }
 

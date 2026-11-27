@@ -161,8 +161,9 @@ fn pack_block(data: &[u8], mode: Mode, threads: usize) -> Packed {
         return stored(data, crc, "");
     }
     // zip / gzip content first: deflated data looks random to the test below
-    if mode == Mode::Max {
-        if let Some((kind, out, note)) = pack_rezip(data, threads) {
+    {
+        let r = if mode == Mode::Max { pack_rezip(data, threads) } else { pack_rezip_fast(data, threads) };
+        if let Some((kind, out, note)) = r {
             if out.len() < data.len() {
                 return Packed { kind, raw_len: data.len(), crc, data: out, note };
             }
@@ -319,6 +320,35 @@ fn pack_rezip(data: &[u8], threads: usize) -> Option<(u8, Vec<u8>, &'static str)
     Some((KIND_REZIP, out, "deflate rebuilt"))
 }
 
+/// Fast-mode deflate recompression: the same layout as `pack_rezip`, the inflated bytes
+/// LZ-coded in fast-block-sized parts.
+fn pack_rezip_fast(data: &[u8], threads: usize) -> Option<(u8, Vec<u8>, &'static str)> {
+    if !crate::sys::dev_flag("NZ_FREZIP") {
+        return None;
+    }
+    let x = crate::rezip::expand(data, threads, data.len() * REZIP_GROWTH + (16 << 20))?;
+    let chunk = 4 << 20;
+    let tab = crate::rezip::write_recs(&x.recs);
+    let mut out = Vec::with_capacity(data.len() / 2);
+    write_varint(&mut out, tab.len() as u64);
+    out.extend_from_slice(&tab);
+    let n = x.data.len().div_ceil(chunk);
+    write_varint(&mut out, n as u64);
+    let spans: Vec<(usize, usize)> = (0..n).map(|c| (c * chunk, ((c + 1) * chunk).min(x.data.len()))).collect();
+    let packed = par::map(&spans, threads, |&(s, e)| {
+        let part = &x.data[s..e];
+        let z = crate::lz::compress(part);
+        if z.len() >= part.len() { (KIND_STORED, part.to_vec()) } else { (KIND_LZ, z) }
+    });
+    for (&(s, e), (kind, payload)) in spans.iter().zip(packed) {
+        out.push(kind);
+        write_varint(&mut out, (e - s) as u64);
+        write_varint(&mut out, payload.len() as u64);
+        out.extend_from_slice(&payload);
+    }
+    Some((KIND_REZIP, out, "deflate rebuilt"))
+}
+
 /// Largest inflated size, as a multiple of the block (bounds decoder memory).
 const REZIP_GROWTH: usize = 3;
 
@@ -334,7 +364,7 @@ fn unpack_rezip(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, Str
     r = &r[tl..];
     let n = read_varint(&mut r).map_err(|_| e())? as usize;
     let cap = raw_len * REZIP_GROWTH + (16 << 20);
-    if n > cap / (16 << 20) + 2 {
+    if n > cap / (4 << 20) + 2 {
         return Err(e());
     }
     let mut parts = Vec::with_capacity(n);
@@ -529,19 +559,6 @@ fn unpack_lz(p: &[u8], raw_len: usize, threads: usize) -> Result<Vec<u8>, String
     j
 }
 
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match r.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(n)
-}
-
 pub struct Stats {
     pub in_bytes: u64,
     pub out_bytes: u64,
@@ -552,9 +569,30 @@ pub struct Stats {
     pub largest: u64,
 }
 
+/// Input of `compress`: `total` bytes read at any offset, from any thread (each block
+/// worker reads its own block, so reading runs on every core).
+pub trait Source: Sync {
+    /// Fills `buf` with the bytes at `off` (an error if they are not all there).
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()>;
+}
+
+impl Source for Vec<u8> {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let s = self.get(off as usize..off as usize + buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?;
+        buf.copy_from_slice(s);
+        Ok(())
+    }
+}
+
+impl Source for std::fs::File {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        crate::sys::read_at(self, buf, off)
+    }
+}
+
 /// `cuts`: sorted stream offsets where a block boundary is preferred: (offset, type change),
 /// at every file start.
-pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out: W, o: &Options, cuts: &[(u64, bool)]) -> io::Result<Stats> {
+pub fn compress<W: Write + Send>(input: &dyn Source, total: u64, flags: u8, mut out: W, o: &Options, cuts: &[(u64, bool)]) -> io::Result<Stats> {
     // the GPU driver starts in the background while the first blocks are read and tried
     if o.mode == Mode::Max && total >= 4 << 20 {
         crate::gpu::warm();
@@ -584,66 +622,99 @@ pub fn compress<R: Read, W: Write>(mut input: R, total: u64, flags: u8, mut out:
     let mut eof = false;
     let mut nblock = 0usize;
     let verbose = o.verbose;
-    par::pipeline(
-        workers,
-        workers,
-        true,
-        || {
-            if eof {
-                return Ok(None);
+    // finished blocks wait for a slow one before them (they are written in order): let
+    // more of them wait, as RAM allows, so the threads keep working meanwhile
+    let spare = crate::sys::mem_budget().saturating_sub(workers as u64 * block_mem(o.mode, bs));
+    let ahead = ((spare / bs as u64) as usize).clamp(workers, 4 * workers);
+    // blocks are written on a thread of their own: writing hundreds of MB is serial work
+    // that would otherwise hold up handing out the next blocks
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Packed>(ahead);
+    let stm = &mut st;
+    std::thread::scope(|sc| {
+        let writer = sc.spawn(move || -> io::Result<()> {
+            for p in rx {
+                let mut h = Vec::with_capacity(24);
+                h.push(p.kind);
+                write_varint(&mut h, p.raw_len as u64);
+                write_varint(&mut h, p.data.len() as u64);
+                h.extend_from_slice(&p.crc.to_le_bytes());
+                out.write_all(&h)?;
+                out.write_all(&p.data)?;
+                stm.in_bytes += p.raw_len as u64;
+                stm.out_bytes += (h.len() + p.data.len()) as u64;
+                stm.blocks += 1;
+                stm.largest = stm.largest.max(p.raw_len as u64);
+                if verbose {
+                    eprintln!("  block {:>4}: {:>11} -> {:>11} {}", stm.blocks, p.raw_len, p.data.len(), p.note);
+                }
+                drop(p);
             }
-            let end = pos + bs as u64;
-            while ci < cuts.len() && cuts[ci].0 <= pos {
-                ci += 1;
+            if crate::sys::dev_flag("NZ_BT") {
+                eprintln!("writer done at {:.4}", T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64());
             }
-            let ahead = cuts[ci..].iter().take_while(|c| c.0 < end);
-            // a change of file type ends the block (once it holds min_fill); otherwise the
-            // block takes as many whole files as fit, cutting a file only if it must
-            let want = match ahead.clone().find(|c| c.1 && c.0 >= pos + min_fill) {
-                Some(c) => c.0 - pos,
-                None if end >= total => bs as u64,
-                None => ahead.filter(|c| c.0 >= pos + bs as u64 / 2).last().map_or(bs as u64, |c| c.0 - pos),
-            };
-            let want = want as usize;
-            let mut b = vec![0u8; want];
-            let n = read_full(&mut input, &mut b)?;
-            b.truncate(n);
-            pos += n as u64;
-            if n < want {
-                eof = true;
-            }
-            if n == 0 {
-                return Ok(None);
-            }
-            nblock += 1;
-            Ok(Some(b))
-        },
-        |b: Vec<u8>| {
-            let p = pack_block(&b, o.mode, threads);
-            crate::progress::block(b.len() as u64);
-            p
-        },
-        |p: Packed| {
-            let mut h = Vec::with_capacity(24);
-            h.push(p.kind);
-            write_varint(&mut h, p.raw_len as u64);
-            write_varint(&mut h, p.data.len() as u64);
-            h.extend_from_slice(&p.crc.to_le_bytes());
-            out.write_all(&h)?;
-            out.write_all(&p.data)?;
-            st.in_bytes += p.raw_len as u64;
-            st.out_bytes += (h.len() + p.data.len()) as u64;
-            st.blocks += 1;
-            st.largest = st.largest.max(p.raw_len as u64);
-            if verbose {
-                eprintln!("  block {:>4}: {:>11} -> {:>11} {}", st.blocks, p.raw_len, p.data.len(), p.note);
-            }
-            Ok(())
-        },
-    )?;
-    out.write_all(&[KIND_END])?;
-    st.out_bytes += 1;
-    out.flush()?;
+            out.write_all(&[KIND_END])?;
+            stm.out_bytes += 1;
+            out.flush()
+        });
+        let r = par::pipeline(
+            workers,
+            ahead,
+            true,
+            || {
+                if eof {
+                    return Ok(None);
+                }
+                let end = pos + bs as u64;
+                while ci < cuts.len() && cuts[ci].0 <= pos {
+                    ci += 1;
+                }
+                let ahead = cuts[ci..].iter().take_while(|c| c.0 < end);
+                // a change of file type ends the block (once it holds min_fill); otherwise the
+                // block takes as many whole files as fit, cutting a file only if it must
+                let want = match ahead.clone().find(|c| c.1 && c.0 >= pos + min_fill) {
+                    Some(c) => c.0 - pos,
+                    None if end >= total => bs as u64,
+                    None => ahead.filter(|c| c.0 >= pos + bs as u64 / 2).last().map_or(bs as u64, |c| c.0 - pos),
+                };
+                let want = (want.min(total - pos)) as usize;
+                if want == 0 {
+                    eof = true;
+                    return Ok(None);
+                }
+                let at = pos;
+                pos += want as u64;
+                nblock += 1;
+                Ok(Some((at, want)))
+            },
+            |(at, want): (u64, usize)| -> io::Result<Packed> {
+                // one read buffer per thread, reused: a fresh one is faulted in page by page
+                thread_local!(static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) });
+                BUF.with(|buf| {
+                    let mut b = buf.borrow_mut();
+                    let t = std::time::Instant::now();
+                    b.resize(want, 0);
+                    input.read_at(at, &mut b)?;
+                    let tr = t.elapsed().as_secs_f64();
+                    let p = pack_block(&b, o.mode, threads);
+                    if crate::sys::dev_flag("NZ_BT") {
+                        let t0 = T0.get_or_init(std::time::Instant::now);
+                        eprintln!("BT {:.4} {:.4} {:.4} {} {}", (t - *t0).as_secs_f64(), tr, t.elapsed().as_secs_f64(), want, p.note);
+                    }
+                    crate::progress::block(want as u64);
+                    // big Max blocks: give the memory back between blocks
+                    if b.capacity() > 64 << 20 {
+                        *b = Vec::new();
+                    }
+                    Ok(p)
+                })
+            },
+            |p: io::Result<Packed>| tx.send(p?).map_err(|_| io::Error::other("writer stopped")),
+        );
+        drop(tx);
+        let w = writer.join().unwrap_or_else(|_| Err(io::Error::other("writer panicked")));
+        // a writer error explains a "writer stopped" from the pipeline
+        w.and(r)
+    })?;
     Ok(st)
 }
 

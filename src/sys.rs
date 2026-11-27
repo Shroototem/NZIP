@@ -27,7 +27,7 @@ pub fn cpus() -> usize {
 
 /// Asks Windows not to power-throttle this process: Windows 11 otherwise may run a
 /// console program whose window is not in front on efficiency cores at low clocks (Intel
-/// hybrid CPUs). Priority is not changed. No effect elsewhere.
+/// hybrid CPUs). No effect elsewhere (priority is `set_priority`'s job).
 pub fn no_throttle() {
     #[cfg(windows)]
     {
@@ -182,6 +182,60 @@ pub fn peak_rss() -> Option<u64> {
     None
 }
 
+/// Process priority (the --priority option): how much nzip yields the CPU (and disk) to
+/// other programs. It never changes how fast nzip runs on an idle machine.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Priority {
+    /// below normal (Unix nice 10, Windows BELOW_NORMAL): the desktop stays responsive
+    Low,
+    /// only when nothing else wants the CPU (nice 19, Windows IDLE)
+    Idle,
+    /// unchanged
+    Normal,
+}
+
+/// Lowers this process's CPU (and, on Linux, I/O) priority. Call before any thread starts:
+/// on Linux the setting is per thread and new threads inherit it.
+pub fn set_priority(p: Priority) {
+    if p == Priority::Normal {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        }
+        // PRIO_PROCESS = 0, who 0 = this process (this thread on Linux)
+        unsafe { setpriority(0, 0, if p == Priority::Idle { 19 } else { 10 }) };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn syscall(n: i64, ...) -> i64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        const IOPRIO_SET: i64 = 251;
+        #[cfg(target_arch = "aarch64")]
+        const IOPRIO_SET: i64 = 30;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            // IOPRIO_WHO_PROCESS = 1; best effort class (2) at its lowest level (7), or the idle class (3)
+            let prio: i64 = if p == Priority::Idle { 3 << 13 } else { (2 << 13) | 7 };
+            unsafe { syscall(IOPRIO_SET, 1i64, 0i64, prio) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn SetPriorityClass(p: *mut core::ffi::c_void, class: u32) -> i32;
+        }
+        // BELOW_NORMAL_PRIORITY_CLASS / IDLE_PRIORITY_CLASS
+        unsafe { SetPriorityClass(GetCurrentProcess(), if p == Priority::Idle { 0x40 } else { 0x4000 }) };
+    }
+}
+
 /// Raises the soft limit on open files to the hard limit (Unix): folders of many files are
 /// read on every thread at once.
 pub fn raise_open_files() {
@@ -206,3 +260,25 @@ pub fn raise_open_files() {
         }
     }
 }
+
+/// Reads `buf.len()` bytes at `off` without moving a shared file position.
+pub fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match f.seek_read(&mut buf[done..], off + done as u64)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                k => done += k,
+            }
+        }
+        Ok(())
+    }
+}
+

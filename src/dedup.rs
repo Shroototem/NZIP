@@ -59,11 +59,13 @@ static GEAR: [u64; 256] = gear_table();
 /// Content key of a chunk (64-bit; equal keys are only candidates, see `confirm`).
 pub fn chunk_key(c: &[u8]) -> u64 {
     let (mut x, mut y) = (0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64);
-    let mut w = c.chunks_exact(8);
+    // two independent chains, alternate words each: twice the speed of one chain
+    let mut w = c.chunks_exact(16);
     for v in &mut w {
-        let v = u64::from_le_bytes(v.try_into().unwrap());
-        x = (x ^ v).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
-        y = (y ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+        let a = u64::from_le_bytes(v[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(v[8..].try_into().unwrap());
+        x = (x ^ a).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+        y = (y ^ b).wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(31);
     }
     for &b in w.remainder() {
         x = (x ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
@@ -140,6 +142,51 @@ fn chunk_file(p: &Path, size: u64) -> io::Result<(Vec<(u64, u32)>, bool)> {
     }
 }
 
+/// Positions (`base` + index + 1) in `b[from..]` after which the gear hash of the bytes so
+/// far has its top `bits` bits clear. The hash only remembers the last 64 bytes, so four
+/// lanes, each started 64 bytes early, run side by side (the hash is a serial chain of
+/// one shift and one add per byte) and give the same positions as one pass from b[0].
+fn gear_cands(b: &[u8], from: usize, bits: u32, base: u64, out: &mut Vec<u64>) {
+    let g = |h: u64, c: u8| (h << 1).wrapping_add(GEAR[c as usize]);
+    let warm = |p: usize| b[p.saturating_sub(64)..p].iter().fold(0u64, |h, &c| g(h, c));
+    let q = (b.len() - from) / 4;
+    let p = [from, from + q, from + 2 * q, from + 3 * q];
+    let (mut h0, mut h1, mut h2, mut h3) = (warm(p[0]), warm(p[1]), warm(p[2]), warm(p[3]));
+    let mut v: [Vec<u64>; 3] = std::array::from_fn(|_| Vec::with_capacity((q >> bits) * 2 + 8));
+    let sh = 64 - bits;
+    let (l0, l1, l2, l3) = (&b[p[0]..p[0] + q], &b[p[1]..p[1] + q], &b[p[2]..p[2] + q], &b[p[3]..p[3] + q]);
+    for j in 0..q {
+        h0 = g(h0, l0[j]);
+        h1 = g(h1, l1[j]);
+        h2 = g(h2, l2[j]);
+        h3 = g(h3, l3[j]);
+        if (h0 >> sh == 0) | (h1 >> sh == 0) | (h2 >> sh == 0) | (h3 >> sh == 0) {
+            let at = base + j as u64 + 1;
+            if h0 >> sh == 0 {
+                out.push(at + p[0] as u64);
+            }
+            if h1 >> sh == 0 {
+                v[0].push(at + p[1] as u64);
+            }
+            if h2 >> sh == 0 {
+                v[1].push(at + p[2] as u64);
+            }
+            if h3 >> sh == 0 {
+                v[2].push(at + p[3] as u64);
+            }
+        }
+    }
+    for x in v {
+        out.extend_from_slice(&x);
+    }
+    for (i, &c) in b.iter().enumerate().skip(p[3] + q) {
+        h3 = g(h3, c);
+        if h3 >> sh == 0 {
+            out.push(base + i as u64 + 1);
+        }
+    }
+}
+
 /// Bytes per chunking job: small enough that a slice stays in cache from reading to
 /// hashing to keying.
 const SLICE: u64 = 4 << 20;
@@ -180,21 +227,15 @@ fn chunk_round(round: &[(usize, &Path, u64)], threads: usize) -> Vec<io::Result<
         let f = File::open(p)?;
         let b0 = s.saturating_sub(64);
         let b1 = (e + max_chunk).min(size);
-        let mut b = vec![0u8; (b1 - b0) as usize];
+        // one buffer per thread, reused: a fresh one would be faulted in and zeroed page by page
+        thread_local!(static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) });
+        let mut b = BUF.with(|x| std::mem::take(&mut *x.borrow_mut()));
+        b.resize((b1 - b0) as usize, 0);
         read_at(&f, &mut b, b0)?;
         let text = s == 0 && texty(&b[..b.len().min(64 << 10)]);
         // candidates in (s, b1]
-        let mut h = 0u64;
-        for &c in &b[..(s - b0) as usize] {
-            h = (h << 1).wrapping_add(GEAR[c as usize]);
-        }
         let mut cands = Vec::with_capacity(((b1 - s) >> bits) as usize * 2 + 8);
-        for (j, &c) in b[(s - b0) as usize..].iter().enumerate() {
-            h = (h << 1).wrapping_add(GEAR[c as usize]);
-            if h >> (64 - bits) == 0 {
-                cands.push(s + j as u64 + 1);
-            }
-        }
+        gear_cands(&b, (s - b0) as usize, bits, b0, &mut cands);
         // chunks from s, those that start before e
         let (mut starts, mut keys) = (Vec::new(), Vec::new());
         let mut p0 = s;
@@ -209,6 +250,7 @@ fn chunk_round(round: &[(usize, &Path, u64)], threads: usize) -> Vec<io::Result<
             keys.push((chunk_key(&b[(p0 - b0) as usize..(end - b0) as usize]), (end - p0) as u32));
             p0 = end;
         }
+        BUF.with(|x| *x.borrow_mut() = b);
         Ok(SliceChunks { starts, keys, cands, text })
     });
     // join each file's slices in order
@@ -261,25 +303,8 @@ fn chunk_round(round: &[(usize, &Path, u64)], threads: usize) -> Vec<io::Result<
     out
 }
 
-/// Reads `buf.len()` bytes at `off` without moving a shared file position.
 fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        f.read_exact_at(buf, off)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        let mut done = 0;
-        while done < buf.len() {
-            match f.seek_read(&mut buf[done..], off + done as u64)? {
-                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-                k => done += k,
-            }
-        }
-        Ok(())
-    }
+    crate::sys::read_at(f, buf, off)
 }
 
 /// Chunk index: open addressing over u64 slots holding a 24-bit key fingerprint and the
@@ -297,6 +322,16 @@ impl Index {
         let max = ((crate::sys::mem_budget() / 256).max(1 << 17).next_power_of_two() / 2).max(1 << 16);
         let cap = (chunks + chunks / 2).next_power_of_two().clamp(1 << 16, max);
         Index { slots: vec![0; cap as usize], used: 0 }
+    }
+    #[inline(always)]
+    fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let i = key as usize & (self.slots.len() - 1);
+            std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
     }
     /// The offset of an earlier chunk with this key, else indexes `pos` under it.
     fn find_or_insert(&mut self, key: u64, pos: u64) -> Option<u64> {
@@ -392,43 +427,90 @@ pub fn find(files: &[(usize, &Path, u64)], threads: usize) -> io::Result<Vec<Opt
         let tc = std::time::Instant::now();
         let chunks = chunk_round(round, threads).into_iter().collect::<io::Result<Vec<_>>>()?;
         tchunk += tc.elapsed().as_secs_f64();
-        // every chunk of the round: (key, stream offset)
-        let mut keys: Vec<(u64, u64)> = Vec::with_capacity(chunks.iter().map(|c| c.0.len()).sum());
-        for (j, (ch, _)) in chunks.iter().enumerate() {
-            let mut at = starts[out.len() + j];
-            for &(key, len) in ch {
-                keys.push((key, at));
-                at += len as u64;
+        let lapt = |w: &str| {
+            if tm {
+                eprintln!("    {w} {:.3}", t0.elapsed().as_secs_f64());
             }
+        };
+        lapt("chunked");
+        // every chunk of the round: (key, stream offset), each file's on its own thread
+        let o0 = out.len();
+        let counts: Vec<usize> = chunks.iter().map(|c| c.0.len()).collect();
+        let nk: usize = counts.iter().sum();
+        let mut keys: Vec<(u64, u64)> = vec![(0, 0); nk];
+        {
+            let mut slices = Vec::with_capacity(counts.len());
+            let mut rest = &mut keys[..];
+            for &c in &counts {
+                let (a, b) = rest.split_at_mut(c);
+                slices.push(a);
+                rest = b;
+            }
+            crate::par::for_chunks(slices, threads, |j, sl| {
+                let mut at = starts[o0 + j];
+                for (d, &(key, len)) in sl.iter_mut().zip(&chunks[j].0) {
+                    *d = (key, at);
+                    at += len as u64;
+                }
+            });
         }
-        let mut by: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
-        for (k, &(key, _)) in keys.iter().enumerate() {
-            by[shard_of(key)].push(k as u32);
-        }
-        let ids: Vec<usize> = (0..SHARDS).collect();
-        let hits: Vec<Vec<(u32, u64)>> = crate::par::map(&ids, threads, |&sh| {
-            let mut ix = shards[sh].lock().unwrap();
-            by[sh].iter().filter_map(|&k| ix.find_or_insert(keys[k as usize].0, keys[k as usize].1).map(|pos| (k, pos))).collect()
+        lapt("keys");
+        // each part of the round's chunks sorted into the shards (in order)
+        let part = nk.div_ceil(threads * 2).max(1 << 14);
+        let ranges: Vec<(usize, usize)> = (0..nk.div_ceil(part)).map(|p| (p * part, ((p + 1) * part).min(nk))).collect();
+        // (key, offset, chunk): read in order by the shard, no lookups back into `keys`
+        let parts: Vec<Vec<Vec<(u64, u64, u32)>>> = crate::par::map(&ranges, threads, |&(a, b)| {
+            let mut by: Vec<Vec<(u64, u64, u32)>> = vec![Vec::with_capacity((b - a) / SHARDS * 2); SHARDS];
+            for (k, &(key, at)) in keys[a..b].iter().enumerate() {
+                by[shard_of(key)].push((key, at, (a + k) as u32));
+            }
+            by
         });
-        let mut found: Vec<Option<u64>> = vec![None; keys.len()];
-        for (k, pos) in hits.into_iter().flatten() {
-            found[k as usize] = Some(pos);
+        drop(keys);
+        lapt("by");
+        // per chunk: the earlier position + 1, or 0 (zeroed memory comes free from the OS)
+        let mut found_mem = vec![0u64; nk];
+        // safety: AtomicU64 has the size and alignment of u64, and found_mem is not used
+        // otherwise while `found` lives
+        let found: &[std::sync::atomic::AtomicU64] = unsafe { &*(found_mem.as_mut_slice() as *mut [u64] as *const [std::sync::atomic::AtomicU64]) };
+        let ids: Vec<usize> = (0..SHARDS).collect();
+        crate::par::map(&ids, threads, |&sh| {
+            let mut ix = shards[sh].lock().unwrap();
+            for p in &parts {
+                let v = &p[sh];
+                for (i, &(key, at, k)) in v.iter().enumerate() {
+                    if let Some(&(next, ..)) = v.get(i + 8) {
+                        ix.prefetch(next);
+                    }
+                    if let Some(pos) = ix.find_or_insert(key, at) {
+                        found[k as usize].store(pos + 1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        lapt("hits");
+        let mut kbase = Vec::with_capacity(counts.len());
+        let mut acc = 0;
+        for &c in &counts {
+            kbase.push(acc);
+            acc += c;
         }
-        let mut kf = 0usize;
-        for (ch, text) in chunks {
-            let fi = out.len();
+        lapt("found");
+        let fis: Vec<usize> = (0..chunks.len()).collect();
+        let res = crate::par::map(&fis, threads, |&j| {
+            let (ch, text) = (&chunks[j].0, chunks[j].1);
+            let fi = o0 + j;
             let base = starts[fi];
             let mut segs = Vec::new();
-            for (_, len) in ch {
+            for (i, &(_, len)) in ch.iter().enumerate() {
                 let len = len as u64;
-                let hit = found[kf];
-                kf += 1;
-                match hit {
-                    Some(pos) => {
+                match found[kbase[j] + i].load(std::sync::atomic::Ordering::Relaxed) {
+                    0 => push_lit(&mut segs, len),
+                    pos1 => {
+                        let pos = pos1 - 1;
                         let sf = starts.partition_point(|&x| x <= pos) - 1;
                         push_copy(&mut segs, files[sf].0, pos - starts[sf], len);
                     }
-                    None => push_lit(&mut segs, len),
                 }
             }
             // near, short copies go back to the LZ coder
@@ -449,8 +531,9 @@ pub fn find(files: &[(usize, &Path, u64)], threads: usize) -> io::Result<Vec<Opt
                 }
                 at += g.len();
             }
-            out.push(if kept.iter().any(|g| matches!(g, Seg::Copy { .. })) { Some(kept) } else { None });
-        }
+            if kept.iter().any(|g| matches!(g, Seg::Copy { .. })) { Some(kept) } else { None }
+        });
+        out.extend(res);
     }
     if tm {
         eprintln!("  dedup: {} files {} MB, chunking {tchunk:.3}s, chunk+index {:.3}s", files.len(), total >> 20, t0.elapsed().as_secs_f64());
@@ -467,6 +550,9 @@ pub fn find(files: &[(usize, &Path, u64)], threads: usize) -> io::Result<Vec<Opt
             }
             at += g.len();
         }
+    }
+    if tm {
+        eprintln!("  dedup: {} copies, {} MB to confirm", items.len(), items.iter().map(|i| i.4).sum::<u64>() >> 20);
     }
     let mut groups: Vec<&[(usize, u64, usize, u64, u64)]> = Vec::new();
     let (mut g0, mut bytes) = (0usize, 0u64);

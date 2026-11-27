@@ -80,15 +80,18 @@ fn use_dist(reps: &mut [usize; REPS], d: usize) -> usize {
 
 // ---------------------------------------------------------------- bits
 
+/// LSB-first bit writer into a buffer sized up front for `max_bits` (a put past that
+/// panics, never writes out of bounds).
 struct BitW {
     out: Vec<u8>,
+    pos: usize,
     acc: u64,
     n: u32,
 }
 
 impl BitW {
-    fn new(cap: usize) -> BitW {
-        BitW { out: Vec::with_capacity(cap), acc: 0, n: 0 }
+    fn new(max_bits: usize) -> BitW {
+        BitW { out: vec![0u8; max_bits / 8 + 16], pos: 0, acc: 0, n: 0 }
     }
     /// Appends the low `k` (<= 32) bits of `v`, LSB first.
     #[inline(always)]
@@ -96,17 +99,20 @@ impl BitW {
         self.acc |= v << self.n;
         self.n += k;
         if self.n >= 32 {
-            self.out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.out[self.pos..self.pos + 4].copy_from_slice(&(self.acc as u32).to_le_bytes());
+            self.pos += 4;
             self.acc >>= 32;
             self.n -= 32;
         }
     }
     fn finish(mut self) -> Vec<u8> {
         while self.n > 0 {
-            self.out.push(self.acc as u8);
+            self.out[self.pos] = self.acc as u8;
+            self.pos += 1;
             self.acc >>= 8;
             self.n = self.n.saturating_sub(8);
         }
+        self.out.truncate(self.pos);
         self.out
     }
 }
@@ -316,7 +322,9 @@ fn extend(s: &[u8], a: usize, b: usize, from: usize) -> usize {
     l
 }
 
-/// Match finder knobs (dev overrides NZ_FHB, NZ_FWAYS, NZ_FLAZY).
+/// Match finder knobs (dev overrides NZ_FHB, NZ_FWAYS, NZ_FLONG, NZ_FSKIP, NZ_FINS:
+/// insert every k-th position inside matches, NZ_FLAZY=2 + NZ_FL2: a second lazy step
+/// for matches shorter than that; ~1% smaller, ~3% slower, so off).
 fn knob(name: &str, def: usize) -> usize {
     crate::sys::dev_var(name).and_then(|v| v.parse().ok()).unwrap_or(def)
 }
@@ -409,6 +417,9 @@ fn parse(s: &[u8]) -> (Vec<u8>, Vec<Seq>) {
     };
     let lazy = knob("NZ_FLAZY", 1) != 0;
     let skip = knob("NZ_FSKIP", 7) as u32;
+    let ins = knob("NZ_FINS", 0);
+    let lazy2 = knob("NZ_FLAZY", 1) >= 2;
+    let l2max = knob("NZ_FL2", 16);
     let mut anchor = 0;
     let mut reps = [1usize; REPS];
     let mut i = 1;
@@ -436,7 +447,17 @@ fn parse(s: &[u8]) -> (Vec<u8>, Vec<Seq>) {
             while lazy && m.2 < 64 && m.0 + 1 < limit {
                 match probe(&mut f, m.0 + 1, reps) {
                     Some(m2) if worth(m2.2, m2.0 - m2.1, m2.3) > worth(m.2, m.0 - m.1, m.3) + 4 => m = m2,
-                    _ => break,
+                    _ => {
+                        if lazy2 && m.2 < l2max && m.0 + 2 < limit {
+                            if let Some(m2) = probe(&mut f, m.0 + 2, reps) {
+                                if worth(m2.2, m2.0 - m2.1, m2.3) > worth(m.2, m.0 - m.1, m.3) + 8 {
+                                    m = m2;
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             let (mut st, mut cs, mut len, _) = m;
@@ -455,9 +476,18 @@ fn parse(s: &[u8]) -> (Vec<u8>, Vec<Seq>) {
             anchor = i;
             // positions inside the match: a couple into the table
             if i + 8 <= n {
-                f.insert(s, i - 2);
-                if len > 8 {
-                    f.insert(s, st + len / 2);
+                if ins > 0 {
+                    let mut q = st + 1;
+                    while q + 2 < i {
+                        f.insert(s, q);
+                        q += ins;
+                    }
+                    f.insert(s, i - 2);
+                } else {
+                    f.insert(s, i - 2);
+                    if len > 8 {
+                        f.insert(s, st + len / 2);
+                    }
                 }
             }
         }
@@ -488,14 +518,27 @@ pub fn compress(s: &[u8]) -> Vec<u8> {
     let lit_bits: Vec<Vec<u8>> = if raw {
         vec![lits.clone(), Vec::new(), Vec::new(), Vec::new()]
     } else {
-        let mut ws: Vec<BitW> = (0..4).map(|_| BitW::new(lits.len() / 4 + 8)).collect();
-        for (k, &b) in lits.iter().enumerate() {
-            ws[k & 3].put(cl[b as usize] as u64, ll[b as usize] as u32);
+        // one table entry per byte: code | length << 16
+        let cc: Vec<u32> = (0..LIT_SYMS).map(|b| cl[b] as u32 | (ll[b] as u32) << 16).collect();
+        let max = (lits.len() / 4 + 1) * MAX_BITS as usize;
+        let mut w = [BitW::new(max), BitW::new(max), BitW::new(max), BitW::new(max)];
+        let [w0, w1, w2, w3] = &mut w;
+        let mut q = lits.chunks_exact(4);
+        for c in &mut q {
+            let e = [cc[c[0] as usize], cc[c[1] as usize], cc[c[2] as usize], cc[c[3] as usize]];
+            w0.put((e[0] & 0xFFFF) as u64, e[0] >> 16);
+            w1.put((e[1] & 0xFFFF) as u64, e[1] >> 16);
+            w2.put((e[2] & 0xFFFF) as u64, e[2] >> 16);
+            w3.put((e[3] & 0xFFFF) as u64, e[3] >> 16);
         }
-        ws.into_iter().map(|w| w.finish()).collect()
+        for (k, &b) in q.remainder().iter().enumerate() {
+            w[k].put(cl[b as usize] as u64, ll[b as usize] as u32);
+        }
+        w.into_iter().map(|w| w.finish()).collect()
     };
     let ll = if raw { vec![0u8; LIT_SYMS] } else { ll };
-    let mut w = BitW::new(seqs.len() * 4);
+    // per sequence at most 3 codes and 23 + 23 + 31 extra bits
+    let mut w = BitW::new(seqs.len() * (3 * MAX_BITS as usize + 77) + 64);
     for q in &seqs {
         let (c, k, x) = bucket(q.lit as usize);
         w.put(cr[c] as u64, lr[c] as u32);
@@ -512,6 +555,18 @@ pub fn compress(s: &[u8]) -> Vec<u8> {
         }
     }
     let seq_bits = w.finish();
+    if crate::sys::dev_flag("NZ_FST") {
+        let lb: usize = lit_bits.iter().map(|b| b.len()).sum();
+        let bits = |f: &[u32], l: &[u8]| -> u64 { f.iter().zip(l).map(|(&f, &l)| f as u64 * l as u64).sum::<u64>() / 8 };
+        let xr: u64 = seqs.iter().map(|q| bucket(q.lit as usize).1 as u64).sum::<u64>() / 8;
+        let xm: u64 = seqs.iter().map(|q| bucket(q.len as usize).1 as u64).sum::<u64>() / 8;
+        let xd: u64 = seqs.iter().map(|q| if (q.dist as usize) < REPS { 0 } else { dist_bucket(q.dist as usize - REPS).1 as u64 }).sum::<u64>() / 8;
+        let reps = seqs.iter().filter(|q| (q.dist as usize) < REPS).count();
+        eprintln!(
+            "FST n {} lits {} litB {} seqs {} reps {} run {}+{} len {}+{} dist {}+{}",
+            s.len(), lits.len(), lb, seqs.len(), reps, bits(&fr, &lr), xr, bits(&fm, &lm), xm, bits(&fd, &ld), xd
+        );
+    }
     let mut out = Vec::with_capacity(lit_bits.iter().map(|b| b.len()).sum::<usize>() + seq_bits.len() + 256);
     write_varint(&mut out, seqs.len() as u64);
     write_varint(&mut out, lits.len() as u64);

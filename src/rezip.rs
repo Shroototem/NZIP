@@ -45,6 +45,21 @@ const MIN_COMP: usize = 64;
 struct Cand {
     start: usize,
     csize: Option<usize>,
+    /// zlib stream: the inflated bytes must match the Adler-32 trailer
+    zlib: bool,
+}
+
+fn adler32(d: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for c in d.chunks(5552) {
+        for &x in c {
+            a += x as u32;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    b << 16 | a
 }
 
 fn u16_at(b: &[u8], i: usize) -> usize {
@@ -55,15 +70,24 @@ fn u32_at(b: &[u8], i: usize) -> usize {
     u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize
 }
 
-/// Deflate streams named by zip local headers (method 8) and gzip member headers.
+/// zlib header with a 32 KB window and no preset dictionary (levels 0-1, 2-5, 6, 7-9).
+fn zlib_head(a: u8, b: u8) -> bool {
+    a == 0x78 && matches!(b, 0x01 | 0x5E | 0x9C | 0xDA)
+}
+
+/// Deflate streams named by zip local headers (method 8), gzip member headers and zlib
+/// headers (Minecraft region chunks, PDF and git objects, ...; the Adler-32 trailer weeds
+/// out false hits).
 fn candidates(b: &[u8]) -> Vec<Cand> {
     let mut out = Vec::new();
     let n = b.len();
     let mut i = 0;
     while i + 30 <= n {
-        let Some(k) = b[i..n - 9].windows(2).position(|w| w == b"PK" || w == [0x1F, 0x8B]) else { break };
+        let Some(k) = b[i..n - 9].windows(2).position(|w| w == b"PK" || w == [0x1F, 0x8B] || zlib_head(w[0], w[1])) else { break };
         i += k;
-        if b[i] == b'P' {
+        if b[i] == 0x78 {
+            out.push(Cand { start: i + 2, csize: None, zlib: true });
+        } else if b[i] == b'P' {
             if i + 30 <= n && b[i + 2] == 3 && b[i + 3] == 4 && u16_at(b, i + 8) == 8 {
                 let flags = u16_at(b, i + 6);
                 let nlen = u16_at(b, i + 26);
@@ -73,7 +97,7 @@ fn candidates(b: &[u8]) -> Vec<Cand> {
                 if flags & 1 == 0 && nlen > 0 && nlen < 1024 && start < n {
                     let csize = if flags & 8 == 0 { Some(csize) } else { None };
                     if csize.is_none_or(|c| c >= MIN_COMP && c <= n - start) {
-                        out.push(Cand { start, csize });
+                        out.push(Cand { start, csize, zlib: false });
                     }
                 }
             }
@@ -100,7 +124,7 @@ fn candidates(b: &[u8]) -> Vec<Cand> {
                 p += 2;
             }
             if ok && p < n {
-                out.push(Cand { start: p, csize: None });
+                out.push(Cand { start: p, csize: None, zlib: false });
             }
         }
         i += 2;
@@ -233,6 +257,9 @@ pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
         if c.csize.is_some_and(|cs| cs != used) || used < MIN_COMP {
             return None;
         }
+        if c.zlib && b.get(c.start + used..c.start + used + 4) != Some(&adler32(&raw).to_be_bytes()[..]) {
+            return None;
+        }
         Some((c.start, used, raw))
     });
     lap("inflate");
@@ -252,6 +279,18 @@ pub fn expand(b: &[u8], threads: usize, limit: usize) -> Option<Expanded> {
     let params: Vec<Option<(u8, Vec<(usize, u64)>, bool)>> =
         crate::par::map(&picks, threads, |(s, used, raw)| find_params(raw, &b[*s..*s + *used], threads).map(|(p, sp)| (p, sp, is_text(raw))));
     lap("verify");
+    if tm {
+        let mut h = [0usize; 256];
+        let mut miss = 0;
+        for p in &params {
+            match p {
+                Some((p, ..)) => h[*p as usize] += 1,
+                None => miss += 1,
+            }
+        }
+        let lv: Vec<String> = (0..256).filter(|&i| h[i] > 0).map(|i| format!("l{}m{}:{}", i & 15, i >> 4, h[i])).collect();
+        eprintln!("  rezip {} cands, {} streams, {} not rebuilt, {}", cands.len(), picks.len(), miss, lv.join(" "));
+    }
     let mut out = Vec::with_capacity(b.len() * 2);
     let mut recs = Vec::new();
     let mut pieces: Vec<Piece> = Vec::new();
@@ -434,5 +473,31 @@ mod tests {
         let recs = read_recs(&mut &t[..], b.len()).unwrap();
         assert_eq!(restore(&x.data, &recs, b.len(), 4).unwrap(), b);
         assert_eq!(x.pieces.iter().map(|p| p.len).sum::<usize>(), x.data.len());
+    }
+
+    #[test]
+    fn expand_restore_zlib() {
+        // region-file style: length, type byte, zlib header, stream, Adler-32, padding
+        let text: Vec<u8> = (0..50_000u32).flat_map(|i| format!("tag {} value {}\n", i % 311, i % 7).into_bytes()).collect();
+        let mut b = vec![0u8; 4096];
+        for part in text.chunks(120_000) {
+            let c = crate::zlib::deflate(part, 6, 8);
+            b.extend_from_slice(&((c.len() + 7) as u32).to_be_bytes());
+            b.extend_from_slice(&[2, 0x78, 0x9C]);
+            b.extend_from_slice(&c);
+            b.extend_from_slice(&super::adler32(part).to_be_bytes());
+            b.resize(b.len().next_multiple_of(4096), 0);
+        }
+        let x = expand(&b, 4, usize::MAX).unwrap();
+        assert_eq!(x.recs.len(), text.len().div_ceil(120_000));
+        let t = write_recs(&x.recs);
+        let recs = read_recs(&mut &t[..], b.len()).unwrap();
+        assert_eq!(restore(&x.data, &recs, b.len(), 4).unwrap(), b);
+        // a wrong trailer: not a zlib stream, left alone
+        let mut bad = b.clone();
+        let i = 4096 + 5 + recs[0].comp;
+        bad[i] ^= 1;
+        let n = expand(&bad, 4, usize::MAX).map_or(0, |x| x.recs.len());
+        assert_eq!(n, recs.len() - 1);
     }
 }
