@@ -360,6 +360,9 @@ fn push_copy(segs: &mut Vec<Seg>, src: usize, off: u64, len: u64) {
     segs.push(Seg::Copy { src, off, len });
 }
 
+/// Files a copy-checking job keeps open at once.
+const OPEN_PER_JOB: usize = 4;
+
 /// Index shards (a power of two).
 const SHARDS: usize = 64;
 
@@ -485,6 +488,11 @@ pub fn find(files: &[(usize, &Path, u64)], threads: usize) -> io::Result<Vec<Opt
             let own = files[fi].0;
             for e in [own, src] {
                 if !open.contains_key(&e) {
+                    // a few handles per job: jobs run on every thread, and the process may
+                    // only hold so many files open
+                    if open.len() >= OPEN_PER_JOB {
+                        open.retain(|&k, _| k == own || k == src);
+                    }
                     open.insert(e, File::open(path_of[&e]).map_err(|x| (fi, x))?);
                 }
             }

@@ -181,3 +181,28 @@ pub fn peak_rss() -> Option<u64> {
     #[cfg(not(target_os = "linux"))]
     None
 }
+
+/// Raises the soft limit on open files to the hard limit (Unix): folders of many files are
+/// read on every thread at once.
+pub fn raise_open_files() {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Rlimit {
+            cur: u64,
+            max: u64,
+        }
+        unsafe extern "C" {
+            fn getrlimit(res: i32, r: *mut Rlimit) -> i32;
+            fn setrlimit(res: i32, r: *const Rlimit) -> i32;
+        }
+        const RLIMIT_NOFILE: i32 = 7;
+        let mut r = Rlimit { cur: 0, max: 0 };
+        unsafe {
+            if getrlimit(RLIMIT_NOFILE, &mut r) == 0 && r.cur < r.max {
+                r.cur = r.max;
+                setrlimit(RLIMIT_NOFILE, &r);
+            }
+        }
+    }
+}

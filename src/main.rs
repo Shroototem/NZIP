@@ -307,6 +307,7 @@ fn run(a: Args) -> io::Result<()> {
 fn main() {
     outfile::install_handler();
     sys::no_throttle();
+    sys::raise_open_files();
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {
